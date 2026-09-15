@@ -111,6 +111,7 @@ class Gateway(BaseHTTPRequestHandler):
             "/host-bridge/v1/files/read": "/v1/files/read",
             "/host-bridge/v1/files/write": "/v1/files/write",
             "/host-bridge/v1/process/list": "/v1/process/list",
+            "/host-bridge/v1/browser/open": "/v1/browser/open",
         }
         parsed = urllib.parse.urlsplit(self.path)
         target_path = allowed.get(parsed.path)

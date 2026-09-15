@@ -47,6 +47,22 @@ if ($ps) {
     if ($LASTEXITCODE -eq 0) { Add-Result 'powershell-parse' 'passed' 'Launcher parser check completed.' } else { Add-Result 'powershell-parse' 'failed' 'PowerShell parser check failed.' }
 } else { Add-Result 'powershell-parse' 'unverified-external' 'PowerShell executable unavailable.' }
 
+$python = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($python) {
+    $previousPythonPath = $env:PYTHONPATH
+    Push-Location $root
+    try {
+        $env:PYTHONPATH = $root
+        $unitOutput = @(& $python.Source -m unittest discover -s tests -p 'test_*.py' 2>&1)
+        if ($LASTEXITCODE -eq 0) { Add-Result 'agent-unit-tests' 'passed' 'Direct intent and policy routing tests passed.' }
+        else { Add-Result 'agent-unit-tests' 'failed' (($unitOutput -join "`n").Trim()) }
+    } catch { Add-Result 'agent-unit-tests' 'failed' $_.Exception.Message }
+    finally {
+        Pop-Location
+        if ($null -eq $previousPythonPath) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $previousPythonPath }
+    }
+} else { Add-Result 'agent-unit-tests' 'unverified-external' 'Python executable unavailable.' }
+
 function Get-AcceptanceDocker {
     $command = Get-Command docker.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($command -and $command.Source) { return [string]$command.Source }

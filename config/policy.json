@@ -9,7 +9,8 @@
     "list_windows_directories": {"mutability": "read", "privilege": "user", "network": "host-local", "scope": "windows-read-only", "confirmation": "per-task", "timeout_seconds": 180, "output_limit_bytes": 20000000},
     "read_windows_file": {"mutability": "read", "privilege": "user", "network": "host-local", "scope": "windows-read-only", "confirmation": "per-task", "timeout_seconds": 30, "output_limit_bytes": 16000000},
     "write_windows_file": {"mutability": "write", "privilege": "user", "network": "host-local", "scope": "project-write", "confirmation": "per-action", "timeout_seconds": 30, "output_limit_bytes": 200000},
-    "browser_open_url": {"mutability": "external-effect", "privilege": "user", "network": "host-local", "scope": "default-browser", "confirmation": "per-action", "timeout_seconds": 30, "output_limit_bytes": 200000},
+    "browser_open_url": {"mutability": "external-effect", "privilege": "user", "network": "public-read", "scope": "isolated-browser", "confirmation": "per-action", "timeout_seconds": 35, "output_limit_bytes": 200000},
+    "open_default_browser": {"mutability": "external-effect", "privilege": "user", "network": "host-local", "scope": "default-browser", "confirmation": "per-action", "timeout_seconds": 35, "output_limit_bytes": 200000},
     "list_processes": {"mutability": "read", "privilege": "user", "network": "host-local", "scope": "process-list", "confirmation": "per-task", "timeout_seconds": 30, "output_limit_bytes": 200000},
     "research_fetch": {"mutability": "external-effect", "privilege": "user", "network": "public-read", "scope": "temporary", "confirmation": "per-action", "timeout_seconds": 20, "output_limit_bytes": 2000000},
     "browser_action": {"mutability": "external-effect", "privilege": "user", "network": "public-read", "scope": "isolated-browser", "confirmation": "per-action"}

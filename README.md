@@ -99,9 +99,11 @@ list directories on the configured Windows read-only drive, read bounded
 Windows files, list a bounded Windows process snapshot, and read and write its
 target-local workspace atomically. Large recursive scans write the complete
 discovered path stream under `evidence\` and report whether enumeration or
-terminal display was truncated. Browser opening and interactive browser control
-belong to the browser pack and are unavailable until that isolated service is
-installed and verified.
+terminal display was truncated. An explicit request naming Chrome/default
+browser can launch a URL as a new Chrome tab through the authenticated,
+target-local bridge; it reports `BROWSER_OPEN_REQUESTED` and never claims that
+the tab was observed, controlled, or signed in. Interactive page observation
+and browser control belong to the optional isolated browser pack.
 
 The Windows interoperability bridge is a target-local, loopback-only process
 started by the launcher. It is not WSL2, does not expose the Docker socket, and
@@ -109,9 +111,12 @@ does not grant the agent arbitrary host writes. Host reads are limited to the
 drive containing this project; writes through the bridge are limited to this
 project directory. An explicit request such as `create file named
 evidence\note.txt with content: ...` uses the authenticated atomic host-write
-route and records a target-local confirmation receipt. An explicit `run:
-python --version` request uses a structured argv array with no shell parsing
-and bounded output.
+route and records a target-local confirmation receipt. An explicit `scan my F
+drive` request uses the bounded recursive directory route. An explicit `open
+my default Chrome browser ... in a new tab` request uses a structured Chrome
+launch route and records the result as requested rather than observed. An
+explicit `run: python --version` request uses a structured argv array with no
+shell parsing and bounded output.
 
 ## Status and limitations
 

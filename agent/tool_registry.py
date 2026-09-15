@@ -104,14 +104,24 @@ REGISTRY: dict[str, ToolSpec] = {
     ),
     "browser_open_url": ToolSpec(
         "browser_open_url",
-        "Open an http or https URL in the Windows default browser; opening is reported separately from observation or control.",
+        "Open an http or https URL in the isolated browser service; opening is reported separately from observation or control.",
+        "external-effect",
+        "user",
+        "public-read",
+        "isolated-browser",
+        "per-action",
+        pack="browser",
+        input_schema={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+    ),
+    "open_default_browser": ToolSpec(
+        "open_default_browser",
+        "Open a URL in the installed Windows Chrome browser as a new tab. The result proves launch was requested, not that a tab was observed or controlled.",
         "external-effect",
         "user",
         "host-local",
         "default-browser",
         "per-action",
-        pack="browser",
-        input_schema={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+        input_schema={"type": "object", "properties": {"url": {"type": "string"}, "new_tab": {"type": "boolean"}}, "required": ["url"]},
     ),
     "list_processes": ToolSpec(
         "list_processes",
@@ -427,6 +437,8 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return _bridge_request("/v1/files/write", arguments)
     if name == "browser_open_url":
         return _browser_request(arguments)
+    if name == "open_default_browser":
+        return _bridge_request("/v1/browser/open", arguments, timeout=35.0)
     if name == "list_processes":
         return _bridge_request("/v1/process/list", arguments)
     if name == "research_fetch":

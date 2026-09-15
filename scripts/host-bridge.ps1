@@ -294,6 +294,69 @@ function Set-ProjectFile {
     }
 }
 
+function Get-ChromeExecutable {
+    $candidates = New-Object Collections.Generic.List[string]
+    foreach ($candidate in @(
+            (Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe'),
+            (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe')
+        )) {
+        if ($candidate -and -not $candidates.Contains($candidate)) { [void]$candidates.Add($candidate) }
+    }
+    foreach ($registryPath in @(
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe',
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe',
+            'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe'
+        )) {
+        try {
+            $properties = Get-ItemProperty -LiteralPath $registryPath -ErrorAction Stop
+            $registered = [string]$properties.'(default)'
+            if ($registered -and -not $candidates.Contains($registered)) { [void]$candidates.Add($registered) }
+        } catch { }
+    }
+    foreach ($registryPath in @(
+            'HKCU:\Software\Classes\Applications\chrome.exe\shell\open\command',
+            'HKLM:\Software\Classes\Applications\chrome.exe\shell\open\command'
+        )) {
+        try {
+            $command = [string](Get-ItemProperty -LiteralPath $registryPath -ErrorAction Stop).'(default)'
+            $match = [regex]::Match($command, '^\s*"([^"]+\.exe)"', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            if (-not $match.Success) { $match = [regex]::Match($command, '^\s*([^\s]+\.exe)', [Text.RegularExpressions.RegexOptions]::IgnoreCase) }
+            if ($match.Success -and -not $candidates.Contains($match.Groups[1].Value)) { [void]$candidates.Add($match.Groups[1].Value) }
+        } catch { }
+    }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return (Resolve-Path -LiteralPath $candidate).Path }
+    }
+    throw 'Google Chrome executable was not found in known user or machine installation locations.'
+}
+
+function Open-DefaultChrome {
+    param([Parameter(Mandatory = $true)]$Payload)
+    $rawUrl = [string]$Payload.url
+    if ([string]::IsNullOrWhiteSpace($rawUrl) -or $rawUrl.Length -gt 4096) { throw 'A bounded browser URL is required.' }
+    $uri = $null
+    if (-not [Uri]::TryCreate($rawUrl, [UriKind]::Absolute, [ref]$uri)) { throw 'Browser URL must be absolute.' }
+    if ($uri.Scheme -notin @('http', 'https') -or [string]::IsNullOrWhiteSpace($uri.Host) -or $uri.UserInfo) { throw 'Only credential-free HTTP(S) browser URLs are allowed.' }
+    $chrome = Get-ChromeExecutable
+    $newTab = $true
+    if ($Payload.PSObject.Properties.Name -contains 'new_tab' -and $null -ne $Payload.new_tab) { $newTab = [bool]$Payload.new_tab }
+    $arguments = if ($newTab) { @('--new-tab', $uri.AbsoluteUri) } else { @($uri.AbsoluteUri) }
+    $process = Start-Process -FilePath $chrome -ArgumentList $arguments -WorkingDirectory (Split-Path -Parent $chrome) -PassThru -ErrorAction Stop
+    $confirmation = New-ConfirmationRecord -Operation 'open_default_chrome' -Risk 'external-effect' -Details ([ordered]@{ url = $uri.AbsoluteUri; browser = 'chrome'; new_tab = $newTab; process_id = $process.Id })
+    [ordered]@{
+        status = 'opened-requested'
+        operation = 'open_default_chrome'
+        browser = 'chrome'
+        url = $uri.AbsoluteUri
+        new_tab = $newTab
+        process_id = $process.Id
+        observed = $false
+        controlled = $false
+        confirmation_id = $confirmation.confirmation_id
+    }
+}
+
 function Invoke-Request {
     param([Parameter(Mandatory = $true)]$Request)
     if ($Request.Path -eq '/health' -and $Request.Method -eq 'GET') {
@@ -306,6 +369,7 @@ function Invoke-Request {
         '/v1/files/list' { if ($Request.Method -ne 'POST') { throw 'POST required.' }; return Get-FolderListing -Payload $payload }
         '/v1/files/read' { if ($Request.Method -ne 'POST') { throw 'POST required.' }; return Get-FileText -Payload $payload }
         '/v1/files/write' { if ($Request.Method -ne 'POST') { throw 'POST required.' }; return Set-ProjectFile -Payload $payload }
+        '/v1/browser/open' { if ($Request.Method -ne 'POST') { throw 'POST required.' }; return Open-DefaultChrome -Payload $payload }
         '/v1/process/list' {
             if ($Request.Method -ne 'POST') { throw 'POST required.' }
             $processes = @(Get-Process | Select-Object -First 200 Name, Id, CPU)

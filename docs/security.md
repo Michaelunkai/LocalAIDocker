@@ -13,7 +13,10 @@ rejected by the host bridge.
 
 The host bridge is a target-local, authenticated interoperability process. Its
 read root is the drive containing this project; its write root is this project.
-It does not provide arbitrary host writes or browser-profile access.
+It does not provide arbitrary host writes or browser-profile access. The one
+browser host operation is an explicit, credential-free HTTP(S) URL launch in
+the discovered Chrome executable with a new-tab argument. The receipt is
+`opened-requested`; it deliberately does not assert tab observation or control.
 
 The browser pack runs Chromium in a separate container with a disposable user
 data directory. It accepts only public HTTP(S) targets, returns a bounded DOM

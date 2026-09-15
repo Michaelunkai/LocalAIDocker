@@ -102,9 +102,15 @@ def _direct_intent(message: str) -> tuple[str, dict[str, Any]] | None:
             raise PolicyError("the requested command is blocked by the local policy")
         return "run_command", {"argv": argv, "cwd": "."}
     if any(word in lowered for word in ("open", "launch", "visit")) and (urls or "youtube" in lowered or "browser" in lowered or "chrome" in lowered):
-        if "browser" not in _packs():
-            raise PolicyError("the browser pack is not installed")
         url = urls[0].rstrip(".,);]") if urls else "https://www.youtube.com/"
+        # An explicit request for the user's Chrome/default browser is a
+        # host-local launch request. It is intentionally separate from the
+        # isolated browser pack: a launch receipt cannot claim tab observation
+        # or signed-in control.
+        if any(term in lowered for term in ("default", "chrome", "new tab")):
+            return "open_default_browser", {"url": url, "new_tab": True}
+        if "browser" not in _packs():
+            raise PolicyError("the isolated browser pack is not installed")
         return "browser_open_url", {"url": url}
     if any(word in lowered for word in ("scan", "list", "enumerate", "show")) and any(word in lowered for word in ("drive", "folder", "directory", "directories")):
         path = _windows_path(message)
@@ -125,6 +131,9 @@ def _direct_intent(message: str) -> tuple[str, dict[str, Any]] | None:
 def _render_tool(name: str, result: dict[str, Any]) -> str:
     if name == "browser_open_url":
         prefix = "BROWSER_OPEN_OBSERVED" if result.get("status") == "observed" else "BROWSER_OPEN_FAILED"
+        return prefix + "\n" + json.dumps(result, ensure_ascii=False, indent=2)
+    if name == "open_default_browser":
+        prefix = "BROWSER_OPEN_REQUESTED" if result.get("status") == "opened-requested" else "BROWSER_OPEN_FAILED"
         return prefix + "\n" + json.dumps(result, ensure_ascii=False, indent=2)
     if name == "list_windows_directories":
         lines = [
