@@ -3,17 +3,19 @@
   "workspace_root": "/workspace",
   "network_default": "none",
   "tools": {
-    "read_file": {"mutability": "read", "privilege": "user", "network": "none", "scope": "workspace", "confirmation": "none"},
-    "write_file": {"mutability": "write", "privilege": "user", "network": "none", "scope": "workspace", "confirmation": "per-task"},
-    "run_command": {"mutability": "external-effect", "privilege": "user", "network": "none", "scope": "workspace", "confirmation": "per-task", "shell": false, "timeout_seconds": 120, "output_limit_bytes": 200000},
-    "list_windows_directories": {"mutability": "read", "privilege": "user", "network": "host-local", "scope": "windows-read-only", "confirmation": "per-task", "timeout_seconds": 330, "output_limit_bytes": 20000000},
-    "read_windows_file": {"mutability": "read", "privilege": "user", "network": "host-local", "scope": "windows-read-only", "confirmation": "per-task", "timeout_seconds": 30, "output_limit_bytes": 16000000},
-    "write_windows_file": {"mutability": "write", "privilege": "user", "network": "host-local", "scope": "project-write", "confirmation": "per-action", "timeout_seconds": 30, "output_limit_bytes": 200000},
-    "browser_open_url": {"mutability": "external-effect", "privilege": "user", "network": "public-read", "scope": "isolated-browser", "confirmation": "per-action", "timeout_seconds": 35, "output_limit_bytes": 200000},
-    "open_default_browser": {"mutability": "external-effect", "privilege": "user", "network": "host-local", "scope": "default-browser", "confirmation": "per-action", "timeout_seconds": 35, "output_limit_bytes": 200000},
-    "list_processes": {"mutability": "read", "privilege": "user", "network": "host-local", "scope": "process-list", "confirmation": "per-task", "timeout_seconds": 30, "output_limit_bytes": 200000},
-    "research_fetch": {"mutability": "external-effect", "privilege": "user", "network": "public-read", "scope": "temporary", "confirmation": "per-action", "timeout_seconds": 20, "output_limit_bytes": 2000000},
-    "browser_action": {"mutability": "external-effect", "privilege": "user", "network": "public-read", "scope": "isolated-browser", "confirmation": "per-action"}
+    "read_file": {"pack": "core", "mutability": "read", "privilege": "user", "network": "none", "scope": "workspace", "confirmation": "none", "timeout_seconds": 120, "output_limit_bytes": 200000},
+    "write_file": {"pack": "core", "mutability": "write", "privilege": "user", "network": "none", "scope": "workspace", "confirmation": "per-task", "timeout_seconds": 120, "output_limit_bytes": 200000},
+    "run_command": {"pack": "core", "mutability": "external-effect", "privilege": "user", "network": "none", "scope": "workspace", "confirmation": "per-task", "timeout_seconds": 120, "output_limit_bytes": 200000, "shell": false},
+    "list_windows_directories": {"pack": "core", "mutability": "read", "privilege": "user", "network": "host-local", "scope": "windows-read-only", "confirmation": "per-task", "timeout_seconds": 330, "output_limit_bytes": 20000000},
+    "read_windows_file": {"pack": "core", "mutability": "read", "privilege": "user", "network": "host-local", "scope": "windows-read-only", "confirmation": "per-task", "timeout_seconds": 30, "output_limit_bytes": 200000},
+    "write_windows_file": {"pack": "core", "mutability": "write", "privilege": "user", "network": "host-local", "scope": "project-write", "confirmation": "per-action", "timeout_seconds": 120, "output_limit_bytes": 200000},
+    "browser_open_url": {"pack": "browser", "mutability": "external-effect", "privilege": "user", "network": "public-read", "scope": "isolated-browser", "confirmation": "per-action", "timeout_seconds": 35, "output_limit_bytes": 200000},
+    "open_default_browser": {"pack": "core", "mutability": "external-effect", "privilege": "user", "network": "host-local", "scope": "default-browser", "confirmation": "per-action", "timeout_seconds": 35, "output_limit_bytes": 200000},
+    "list_processes": {"pack": "core", "mutability": "read", "privilege": "user", "network": "host-local", "scope": "process-list", "confirmation": "per-task", "timeout_seconds": 30, "output_limit_bytes": 200000},
+    "research_fetch": {"pack": "research", "mutability": "external-effect", "privilege": "user", "network": "public-read", "scope": "temporary", "confirmation": "per-action", "timeout_seconds": 20, "output_limit_bytes": 2000000},
+    "coding_toolchain_status": {"pack": "coding", "mutability": "read", "privilege": "user", "network": "none", "scope": "container-toolchain", "confirmation": "none", "timeout_seconds": 120, "output_limit_bytes": 200000},
+    "media_toolchain_status": {"pack": "media", "mutability": "read", "privilege": "user", "network": "none", "scope": "container-toolchain", "confirmation": "none", "timeout_seconds": 120, "output_limit_bytes": 200000},
+    "document_toolchain_status": {"pack": "documents", "mutability": "read", "privilege": "user", "network": "none", "scope": "container-toolchain", "confirmation": "none", "timeout_seconds": 120, "output_limit_bytes": 200000}
   },
   "blocked_operations": ["host-docker-socket", "privileged-container", "arbitrary-host-path", "credential-export", "unbounded-process"]
 }

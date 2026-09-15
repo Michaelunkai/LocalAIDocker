@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 from .policy import PolicyError, scoped_path, workspace_root
@@ -38,6 +39,75 @@ class ToolSpec:
         if result["input_schema"] is None:
             result["input_schema"] = {"type": "object"}
         return result
+
+
+_POLICY_FIELDS = ("mutability", "privilege", "network", "scope", "confirmation")
+_POLICY_CACHE: dict[str, Any] | None = None
+_POLICY_LOAD_ERROR: str | None = None
+
+
+def _policy_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    configured = os.environ.get("POLICY_FILE", "").strip()
+    if configured:
+        candidates.append(Path(configured))
+    candidates.append(Path("/app/config/policy.json"))
+    candidates.append(Path(__file__).resolve().parents[1] / "config" / "policy.json")
+    result: list[Path] = []
+    for candidate in candidates:
+        if candidate not in result:
+            result.append(candidate)
+    return result
+
+
+def _load_declared_policy() -> dict[str, Any] | None:
+    global _POLICY_CACHE, _POLICY_LOAD_ERROR
+    if _POLICY_CACHE is not None or _POLICY_LOAD_ERROR is not None:
+        return _POLICY_CACHE
+    for path in _policy_candidates():
+        try:
+            if not path.is_file():
+                continue
+            with path.open("r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if not isinstance(loaded, dict) or not isinstance(loaded.get("tools"), dict):
+                raise ValueError("policy manifest must contain a tools object")
+            _POLICY_CACHE = loaded
+            return _POLICY_CACHE
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            _POLICY_LOAD_ERROR = f"{path}: {exc}"
+            return None
+    _POLICY_LOAD_ERROR = "no policy manifest was found"
+    return None
+
+
+def policy_validation_errors() -> list[str]:
+    policy = _load_declared_policy()
+    if policy is None:
+        return [_POLICY_LOAD_ERROR or "policy manifest could not be loaded"]
+    declared = policy.get("tools", {})
+    errors: list[str] = []
+    for name, spec in REGISTRY.items():
+        entry = declared.get(name)
+        if not isinstance(entry, dict):
+            errors.append(f"{name}: missing from policy manifest")
+            continue
+        for field in _POLICY_FIELDS:
+            if entry.get(field) != getattr(spec, field):
+                errors.append(f"{name}: policy field {field} does not match registry")
+        if entry.get("pack", "core") != spec.pack:
+            errors.append(f"{name}: policy field pack does not match registry")
+        if int(entry.get("timeout_seconds", spec.timeout_seconds)) != spec.timeout_seconds:
+            errors.append(f"{name}: policy timeout does not match registry")
+        if int(entry.get("output_limit_bytes", spec.output_limit_bytes)) != spec.output_limit_bytes:
+            errors.append(f"{name}: policy output limit does not match registry")
+    extras = sorted(set(declared) - set(REGISTRY))
+    errors.extend(f"{name}: policy declares an unimplemented tool" for name in extras)
+    return errors
+
+
+def _policy_allows(spec: ToolSpec) -> bool:
+    return not any(error.startswith(spec.name + ":") for error in policy_validation_errors())
 
 
 REGISTRY: dict[str, ToolSpec] = {
@@ -92,6 +162,7 @@ REGISTRY: dict[str, ToolSpec] = {
         "host-local",
         "windows-read-only",
         "per-task",
+        timeout_seconds=30,
         input_schema={"type": "object", "properties": {"path": {"type": "string"}, "max_bytes": {"type": "integer"}}, "required": ["path"]},
     ),
     "write_windows_file": ToolSpec(
@@ -113,6 +184,7 @@ REGISTRY: dict[str, ToolSpec] = {
         "isolated-browser",
         "per-action",
         pack="browser",
+        timeout_seconds=35,
         input_schema={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
     ),
     "open_default_browser": ToolSpec(
@@ -123,6 +195,7 @@ REGISTRY: dict[str, ToolSpec] = {
         "host-local",
         "default-browser",
         "per-action",
+        timeout_seconds=35,
         input_schema={"type": "object", "properties": {"url": {"type": "string"}, "new_tab": {"type": "boolean"}}, "required": ["url"]},
     ),
     "list_processes": ToolSpec(
@@ -133,6 +206,7 @@ REGISTRY: dict[str, ToolSpec] = {
         "host-local",
         "process-list",
         "per-task",
+        timeout_seconds=30,
         input_schema={"type": "object", "properties": {}},
     ),
     "research_fetch": ToolSpec(
@@ -145,6 +219,7 @@ REGISTRY: dict[str, ToolSpec] = {
         "per-action",
         pack="research",
         timeout_seconds=20,
+        output_limit_bytes=2_000_000,
         input_schema={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
     ),
     "coding_toolchain_status": ToolSpec(
@@ -186,6 +261,8 @@ REGISTRY: dict[str, ToolSpec] = {
 def enabled_tools(installed_packs: set[str]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for spec in REGISTRY.values():
+        if not _policy_allows(spec):
+            continue
         if spec.pack != "core" and spec.pack not in installed_packs:
             continue
         if spec.network == "host-local" and os.environ.get("HOST_BRIDGE_AVAILABLE", "0") != "1":
@@ -433,6 +510,8 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if name not in REGISTRY:
         raise PolicyError(f"unknown tool: {name}")
     spec = REGISTRY[name]
+    if not _policy_allows(spec):
+        raise PolicyError(f"tool '{name}' is unavailable because the policy manifest does not verify it")
     if spec.network == "host-local" and os.environ.get("HOST_BRIDGE_AVAILABLE", "0") != "1":
         raise PolicyError("host interoperability bridge is unavailable")
     if name == "read_file":

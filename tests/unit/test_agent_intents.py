@@ -106,6 +106,9 @@ class DirectIntentTests(unittest.TestCase):
         self.assertIn("list_windows_directories", names)
         self.assertIn("open_default_browser", names)
 
+    def test_policy_manifest_matches_every_implemented_tool(self) -> None:
+        self.assertEqual([], tool_registry.policy_validation_errors())
+
 
 if __name__ == "__main__":
     unittest.main()
