@@ -371,6 +371,25 @@ function Test-Backend {
     $context = (Invoke-Docker @('context', 'show')).Output.Trim()
     if ($Name -eq 'native-linux-gpu') {
         if ([string]$engine.Info.OSType -ne 'linux') { return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = 'GPU backend requires a Linux Docker daemon.'; Context = $context } }
+        if ($context -in @('default', 'desktop-linux') -or [string]$engine.Info.Name -eq 'docker-desktop') {
+            return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = 'GPU backend requires an explicitly selected native Linux Docker context; Docker Desktop contexts are not accepted.'; Context = $context }
+        }
+        $desktopWslEnabled = $false
+        foreach ($settingsPath in @(
+                (Join-Path $env:APPDATA 'Docker\settings-store.json'),
+                (Join-Path $env:LOCALAPPDATA 'Docker\settings-store.json'),
+                (Join-Path $env:PROGRAMDATA 'DockerDesktop\install-settings.json')
+            )) {
+            if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) { continue }
+            try {
+                $dockerSettings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+                $wslProperty = @($dockerSettings.PSObject.Properties | Where-Object { $_.Name -ieq 'WslEngineEnabled' }) | Select-Object -First 1
+                if ($null -ne $wslProperty -and [bool]$wslProperty.Value) { $desktopWslEnabled = $true }
+            } catch { }
+        }
+        if ($desktopWslEnabled) {
+            return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = 'The selected Docker daemon is Docker Desktop with its WSL2 engine enabled; GPU mode requires native Linux Docker.'; Context = $context }
+        }
         if (-not $ProbeGpu) {
             # Read-only checks may inspect the daemon/context only.  Starting
             # a probe container can pull an image and mutate Docker state, so
