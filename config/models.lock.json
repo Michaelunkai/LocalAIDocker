@@ -29,7 +29,7 @@
         "supports_tools": true,
         "supports_vision": false
       },
-      "profiles": ["fast", "coding"]
+      "profiles": ["fast"]
     },
     {
       "id": "qwen25-coder-7b-q4km",

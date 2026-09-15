@@ -20,6 +20,8 @@ smoke-tested, and recorded in `state\current-deployment.json`.
 `verified`, `not-installed`, `failed`, and `unverified-external` are distinct
 states. A model response never upgrades a capability state.
 
-The model registry currently promotes only the locked Qwen2.5-Coder 1.5B GGUF
-candidate for `fast` and `coding`. `balanced`, `quality`, and `vision` have no
-verified candidate in this deployment and must not be presented as ready.
+The model registry currently locks a Qwen2.5-Coder 1.5B GGUF candidate for
+`fast` and a Qwen2.5-Coder 7B Q4_K_M candidate for `balanced`, `quality`, and
+`coding`. The 7B candidate is selected only for its explicitly requested
+profile and is downloaded independently; `vision` still has no verified
+candidate and must not be presented as ready.

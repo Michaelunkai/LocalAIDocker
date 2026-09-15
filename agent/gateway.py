@@ -97,7 +97,8 @@ class Gateway(BaseHTTPRequestHandler):
         request = urllib.request.Request(target, data=body, method=method)
         request.add_header("Content-Type", self.headers.get("Content-Type", "application/json"))
         try:
-            with urllib.request.urlopen(request, timeout=180) as response:
+            request_timeout = 360 if self.path == "/v1/task" else 180
+            with urllib.request.urlopen(request, timeout=request_timeout) as response:
                 self._send(response.status, response.read(MAX_BODY), response.headers.get_content_type())
         except urllib.error.HTTPError as exc:
             self._send(exc.code, exc.read(MAX_BODY))
@@ -132,7 +133,8 @@ class Gateway(BaseHTTPRequestHandler):
         request.add_header("Authorization", self.headers.get("Authorization", ""))
         request.add_header("Content-Type", self.headers.get("Content-Type", "application/json"))
         try:
-            with urllib.request.urlopen(request, timeout=180) as response:
+            request_timeout = 330 if parsed.path == "/host-bridge/v1/files/list" else 35
+            with urllib.request.urlopen(request, timeout=request_timeout) as response:
                 self._send(response.status, response.read(MAX_BODY), response.headers.get_content_type())
         except urllib.error.HTTPError as exc:
             self._send(exc.code, exc.read(MAX_BODY))

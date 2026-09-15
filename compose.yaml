@@ -135,7 +135,10 @@ networks:
   download:
     internal: false
   frontend:
-    internal: false
+    # Host port publishing still works on an internal Docker network; keeping
+    # this network internal prevents the gateway from gaining unrelated
+    # outbound network access in the core deployment.
+    internal: true
 
 secrets:
   localai_api_key:

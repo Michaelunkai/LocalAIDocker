@@ -80,6 +80,8 @@ REGISTRY: dict[str, ToolSpec] = {
         "host-local",
         "windows-read-only",
         "per-task",
+        timeout_seconds=330,
+        output_limit_bytes=20_000_000,
         input_schema={"type": "object", "properties": {"path": {"type": "string"}, "recursive": {"type": "boolean"}, "max_items": {"type": "integer"}}, "required": ["path"]},
     ),
     "read_windows_file": ToolSpec(
@@ -430,7 +432,7 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if name == "run_command":
         return _run_command(arguments)
     if name == "list_windows_directories":
-        return _bridge_request("/v1/files/list", arguments, timeout=180.0)
+        return _bridge_request("/v1/files/list", arguments, timeout=330.0)
     if name == "read_windows_file":
         return _bridge_request("/v1/files/read", arguments)
     if name == "write_windows_file":

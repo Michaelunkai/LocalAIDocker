@@ -123,7 +123,7 @@ def _direct_intent(message: str) -> tuple[str, dict[str, Any]] | None:
         path = _windows_path(message)
         if path:
             return "read_windows_file", {"path": path}
-    if "process" in lowered and any(word in lowered for word in ("list", "show", "what is running")):
+    if ("process" in lowered or "programs" in lowered or "applications" in lowered) and any(word in lowered for word in ("list", "show", "what is running", "running")):
         return "list_processes", {}
     return None
 

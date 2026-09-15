@@ -41,6 +41,24 @@ $violations = foreach ($item in $files) { foreach ($needle in $forbidden) { Sele
 if ($violations) { Add-Result 'forbidden-runtime-reference-scan' 'failed' (($violations | Select-Object -First 10 | ForEach-Object { $_.Path }) -join ';') } else { Add-Result 'forbidden-runtime-reference-scan' 'passed' 'No forbidden runtime references found.' }
 try { Get-Content -LiteralPath (Join-Path $root 'config\runtime.lock.json') -Raw | ConvertFrom-Json | Out-Null; Add-Result 'runtime-lock-json' 'passed' 'Valid JSON.' } catch { Add-Result 'runtime-lock-json' 'failed' $_.Exception.Message }
 try { Get-Content -LiteralPath (Join-Path $root 'config\models.lock.json') -Raw | ConvertFrom-Json | Out-Null; Add-Result 'models-lock-json' 'passed' 'Valid JSON.' } catch { Add-Result 'models-lock-json' 'failed' $_.Exception.Message }
+try {
+    $modelLock = Get-Content -LiteralPath (Join-Path $root 'config\models.lock.json') -Raw | ConvertFrom-Json
+    $modelErrors = New-Object System.Collections.Generic.List[string]
+    foreach ($model in @($modelLock.models)) {
+        $revision = [string]$model.revision
+        if ($revision -notmatch '^[0-9a-fA-F]{40}$') { [void]$modelErrors.Add("$($model.id): revision is not a full commit") }
+        if ([string]::IsNullOrWhiteSpace([string]$model.license)) { [void]$modelErrors.Add("$($model.id): license is missing") }
+        foreach ($artifact in @($model.artifacts)) {
+            $filename = [string]$artifact.filename
+            if ([string]::IsNullOrWhiteSpace($filename) -or [IO.Path]::GetFileName($filename) -ne $filename) { [void]$modelErrors.Add("$($model.id): unsafe artifact filename") }
+            if ([int64]$artifact.size_bytes -le 0) { [void]$modelErrors.Add("$($model.id): artifact size is not positive") }
+            if ([string]$artifact.sha256 -notmatch '^[0-9a-fA-F]{64}$') { [void]$modelErrors.Add("$($model.id): artifact digest is invalid") }
+            if ([string]$artifact.url -notmatch [regex]::Escape($revision)) { [void]$modelErrors.Add("$($model.id): artifact URL is not revision-pinned") }
+        }
+    }
+    if ($modelErrors.Count -eq 0) { Add-Result 'models-lock-schema' 'passed' 'Every locked model has full revision, exact-size, digest, and safe artifact metadata.' }
+    else { Add-Result 'models-lock-schema' 'failed' (($modelErrors | Select-Object -First 12) -join '; ') }
+} catch { Add-Result 'models-lock-schema' 'failed' $_.Exception.Message }
 $ps = Get-Command powershell.exe -CommandType Application -ErrorAction SilentlyContinue
 if ($ps) {
     $parse = & $ps.Source -NoProfile -NonInteractive -Command "[System.Management.Automation.Language.Parser]::ParseFile('$((Join-Path $root 'scripts\llm.ps1').Replace("'", "''"))',[ref]`$null,[ref]`$null) | Out-Null"

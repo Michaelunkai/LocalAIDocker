@@ -45,6 +45,10 @@ $env:LOCALAI_HYPERV_VERIFIED = '1'
 ```
 
 The CPU mode is functional but is not presented as RTX acceleration.
+The locked `fast` profile uses the smaller Qwen2.5-Coder 1.5B artifact; the
+`balanced`, `quality`, and `coding` profiles use the separately locked 7B
+artifact. Only the selected profile's model is downloaded and configured as
+the active model.
 
 ## Native Linux GPU installation
 

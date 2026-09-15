@@ -528,7 +528,7 @@ function Invoke-ApiLive {
             if ($ApiKey) { $requestHeaders.Authorization = 'Bearer ' + $ApiKey }
             try {
                 if ($RequestBody) {
-                    Invoke-RestMethod -Uri $RequestUri -Method Post -Headers $requestHeaders -ContentType 'application/json' -Body $RequestBody -TimeoutSec 180
+                    Invoke-RestMethod -Uri $RequestUri -Method Post -Headers $requestHeaders -ContentType 'application/json' -Body $RequestBody -TimeoutSec 330
                 } else {
                     Invoke-RestMethod -Uri $RequestUri -Method Get -Headers $requestHeaders -TimeoutSec 15
                 }
@@ -771,7 +771,7 @@ function Install-Core {
     $jsonText = $deployment | ConvertTo-Json -Depth 12
     Write-AtomicText $receiptPath $jsonText
     Write-AtomicText (Join-Path $StateRoot 'current-deployment.json') $jsonText
-    $containerState = if ($ForceRecreate) { 'recreated' } else { 'started-or-reused' }
+    $containerState = 'recreated'
     [Console]::Out.WriteLine("LOCALAI_DOCKER_READY backend=$Name app=running containers=$containerState deployment=$($deployment.deployment_id)")
     Write-RunProgress "$Operation finished with verified core inference and committed deployment"
     return 0
@@ -912,7 +912,7 @@ function Start-Interactive {
         if ($handledCommand) { continue }
         Write-RunProgress 'interactive agent task started'
         $body = @{ model = $modelId; message = $prompt; task_id = ('interactive-' + [guid]::NewGuid().ToString('N')) } | ConvertTo-Json -Depth 8
-        $answer = Invoke-ApiLive '/v1/task' $body -Authenticated -Label 'interactive agent task'
+        $answer = Invoke-ApiLive '/v1/task' $body -Authenticated -Label 'interactive agent task' -TimeoutSeconds 330
         if ($null -eq $answer) {
             [Console]::Error.WriteLine('LOCALAI_INTERACTIVE_ERROR reason=agent-task-failed')
             Write-RunProgress 'interactive agent task finished status=failed'

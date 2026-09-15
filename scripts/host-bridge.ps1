@@ -372,7 +372,10 @@ function Invoke-Request {
         '/v1/browser/open' { if ($Request.Method -ne 'POST') { throw 'POST required.' }; return Open-DefaultChrome -Payload $payload }
         '/v1/process/list' {
             if ($Request.Method -ne 'POST') { throw 'POST required.' }
-            $processes = @(Get-Process | Select-Object -First 200 Name, Id, CPU)
+            # Name and Id are available for protected processes where CPU/path
+            # properties may throw. Keep the snapshot useful instead of
+            # turning one inaccessible process into a failed whole request.
+            $processes = @(Get-Process | Select-Object -First 200 Name, Id)
             return [ordered]@{ status = 'verified'; operation = 'list_processes'; processes = $processes; count = $processes.Count }
         }
         default { throw 'route not found' }
