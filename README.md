@@ -123,9 +123,10 @@ shell parsing and bounded output.
 - `LOCALAI_DOCKER_READY` means the deployment receipt, image identity, service health, and inference probe passed.
 - `LOCALAI_DOCKER_NOT_READY` identifies the failed boundary and exit code.
 - Optional packs are not installed by core and never block core readiness.
-- Browser URL opening and observation are available only through the isolated
-  browser pack; signed-in tab control and the host's main browser profile are
-  never used.
+- A default-Chrome URL launch is a host-local requested effect and does not
+  require the isolated browser pack; page observation, DOM extraction, and
+  interactive browser control are available only through that isolated pack.
+  Signed-in tab control and imported main-profile cookies are never used.
 - Research requires the explicit research pack and provider configuration.
 - A native Linux Docker Engine is required for verified NVIDIA acceleration under the no-host-Linux-shell policy.
 

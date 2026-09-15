@@ -47,6 +47,18 @@ if ($ps) {
     if ($LASTEXITCODE -eq 0) { Add-Result 'powershell-parse' 'passed' 'Launcher parser check completed.' } else { Add-Result 'powershell-parse' 'failed' 'PowerShell parser check failed.' }
 } else { Add-Result 'powershell-parse' 'unverified-external' 'PowerShell executable unavailable.' }
 
+try {
+    $scriptErrors = New-Object System.Collections.Generic.List[string]
+    foreach ($scriptFile in Get-ChildItem -LiteralPath (Join-Path $root 'scripts') -Filter '*.ps1' -File -Recurse) {
+        $tokens = $null
+        $errors = $null
+        [System.Management.Automation.Language.Parser]::ParseFile($scriptFile.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+        if ($errors.Count -gt 0) { [void]$scriptErrors.Add($scriptFile.FullName + ': ' + (($errors | Select-Object -First 1).Message)) }
+    }
+    if ($scriptErrors.Count -eq 0) { Add-Result 'all-powershell-parse' 'passed' 'All target PowerShell scripts parse successfully.' }
+    else { Add-Result 'all-powershell-parse' 'failed' (($scriptErrors | Select-Object -First 10) -join '; ') }
+} catch { Add-Result 'all-powershell-parse' 'failed' $_.Exception.Message }
+
 $python = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($python) {
     $previousPythonPath = $env:PYTHONPATH
