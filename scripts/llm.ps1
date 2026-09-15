@@ -364,15 +364,22 @@ function Test-DockerEngine {
 }
 
 function Test-Backend {
-    param([Parameter(Mandatory = $true)][string]$Name)
+    param([Parameter(Mandatory = $true)][string]$Name, [switch]$ProbeGpu)
     $engine = Test-DockerEngine
     if (-not $engine.Ready) { return [pscustomobject]@{ Ready = $false; Code = $Exit.Engine; Reason = $engine.Reason; Engine = $engine } }
     $context = (Invoke-Docker @('context', 'show')).Output.Trim()
     if ($Name -eq 'native-linux-gpu') {
         if ([string]$engine.Info.OSType -ne 'linux') { return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = 'GPU backend requires a Linux Docker daemon.'; Context = $context } }
+        if (-not $ProbeGpu) {
+            # Read-only checks may inspect the daemon/context only.  Starting
+            # a probe container can pull an image and mutate Docker state, so
+            # the actual NVIDIA passthrough test is reserved for explicit
+            # installation or repair.
+            return [pscustomobject]@{ Ready = $true; Code = 0; Backend = $Name; Context = $context; Engine = $engine.Info; GPU = 'not-probed-read-only' }
+        }
         $gpu = Invoke-Docker @('run', '--rm', '--gpus', 'all', 'nvidia/cuda:12.8.0-base-ubuntu24.04@sha256:e778509d37d66475120929671500377524f7278478ba08131b07ef3ffcc0dce0', 'nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader')
         if ($gpu.ExitCode -ne 0) { return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = 'NVIDIA GPU passthrough failed in the selected Docker context.'; Context = $context; GPU = $gpu.Output } }
-        return [pscustomobject]@{ Ready = $true; Code = 0; Backend = $Name; Context = $context; Engine = $engine.Info; GPU = $gpu.Output }
+        return [pscustomobject]@{ Ready = $true; Code = 0; Backend = $Name; Context = $context; Engine = $engine.Info; GPU = $gpu.Output; GpuProbe = 'verified' }
     }
     if ($Name -ne 'hyperv-cpu') { return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = "Unsupported backend: $Name"; Context = $context } }
     if ($context -notmatch 'desktop-linux|default') { return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = "Unexpected local Docker context: $context"; Context = $context } }
@@ -793,6 +800,14 @@ function Test-Ready {
     if ($receiptAcceptance -ne 'core-inference-and-profile-benchmark-passed' -or -not $hasBenchmark) {
         return [pscustomobject]@{ Ready = $false; Code = $Exit.Provenance; Reason = 'Deployment receipt predates the current verified inference-and-profile benchmark contract. Run the normal launcher to rebuild it.'; Backend = $name; Receipt = $receipt }
     }
+    if ($name -eq 'native-linux-gpu') {
+        $gpuPackVerified = $receipt.PSObject.Properties.Name -contains 'packs' -and $null -ne $receipt.packs -and
+            $receipt.packs.PSObject.Properties.Name -contains 'gpu' -and [string]$receipt.packs.gpu -eq 'verified'
+        $gpuProofVerified = $receipt.PSObject.Properties.Name -contains 'backend_proof' -and [string]$receipt.backend_proof -eq 'nvidia-container-runtime-and-smi'
+        if (-not $gpuPackVerified -or -not $gpuProofVerified) {
+            return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = 'The deployment does not contain a verified NVIDIA container-runtime and GPU acceptance proof.'; Backend = $name; Receipt = $receipt }
+        }
+    }
     try {
         $runtimeLock = Read-JsonFile (Join-Path $ConfigRoot 'runtime.lock.json')
         $expectedImageDigest = if ($name -eq 'native-linux-gpu') { [string]$runtimeLock.images.localai_gpu.digest } else { [string]$runtimeLock.images.localai_cpu.digest }
@@ -839,7 +854,7 @@ function Install-Core {
         [string]$Operation = 'installation'
     )
     Write-RunProgress "$Operation started backend=$Name"
-    $backend = Test-Backend $Name
+    $backend = Test-Backend $Name -ProbeGpu
     if (-not $backend.Ready) { Show-Status $backend; return $backend.Code }
     $modelLock = Read-JsonFile (Join-Path $ConfigRoot 'models.lock.json')
     $modelEntry = @($modelLock.models | Where-Object { @($_.profiles) -contains $Profile } | Select-Object -First 1)
