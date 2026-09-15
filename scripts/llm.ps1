@@ -39,6 +39,7 @@ $Exit = @{
     Interrupted = 18; External = 19
 }
 $RunClock = [Diagnostics.Stopwatch]::StartNew()
+$HostBridgeAvailable = $false
 
 $KnownPacks = @('core', 'gpu', 'coding', 'media', 'documents', 'browser', 'research', 'containers', 'harness')
 $Pack = @($Pack | ForEach-Object { [string]$_ -split ',' } | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ } | Select-Object -Unique)
@@ -570,6 +571,7 @@ function Ensure-RuntimeEnv {
         "INSTALL_PACKS=$buildPacks",
         "MODEL_ID=$ModelId",
         "MODEL_PROFILE=$Profile",
+        "HOST_BRIDGE_AVAILABLE=$(if ($HostBridgeAvailable) { '1' } else { '0' })",
         "LOCALAI_API_KEY_FILE=./secrets/localai-api-key",
         "BROWSER_API_KEY_FILE=./secrets/browser-api-key"
     )
@@ -836,14 +838,17 @@ function Test-Ready {
     $health = Invoke-Api '/health'
     if ($null -eq $health) { return [pscustomobject]@{ Ready = $false; Code = $Exit.Server; Reason = 'Gateway health endpoint is unavailable.'; Backend = $name } }
     $bridge = Test-HostBridge
-    if (-not $bridge.Ready) { return [pscustomobject]@{ Ready = $false; Code = $Exit.External; Reason = 'Host interoperability bridge is unavailable: ' + $bridge.Reason; Backend = $name; Receipt = $receipt; Health = $health } }
-    [pscustomobject]@{ Ready = $true; Code = 0; Reason = 'Verified Docker runtime and host interoperability bridge are ready.'; Backend = $name; Receipt = $receipt; Health = $health; HostBridge = $bridge.Health }
+    $bridgeReason = if ($bridge.Ready) { 'Verified Docker runtime and host interoperability bridge are ready.' } else { 'Verified Docker runtime is ready; optional host interoperability is unavailable: ' + $bridge.Reason }
+    [pscustomobject]@{ Ready = $true; Code = 0; Reason = $bridgeReason; Backend = $name; Receipt = $receipt; Health = $health; HostBridge = $bridge; HostBridgeAvailable = [bool]$bridge.Ready }
 }
 
 function Show-Status {
     param([Parameter(Mandatory = $true)]$Status)
     if ($Json) { [Console]::Out.WriteLine(($Status | ConvertTo-Json -Depth 12)); return }
-    if ($Status.Ready) { [Console]::Out.WriteLine("LOCALAI_DOCKER_READY backend=$($Status.Backend)") }
+    if ($Status.Ready) {
+        $bridgeState = if ($Status.PSObject.Properties.Name -contains 'HostBridgeAvailable') { if ($Status.HostBridgeAvailable) { 'ready' } else { 'unavailable' } } else { 'unknown' }
+        [Console]::Out.WriteLine("LOCALAI_DOCKER_READY backend=$($Status.Backend) host_bridge=$bridgeState")
+    }
     else { [Console]::Error.WriteLine("LOCALAI_DOCKER_NOT_READY code=$($Status.Code) reason=$($Status.Reason)") }
 }
 
@@ -867,10 +872,12 @@ function Install-Core {
         $withoutGpu = @(Get-InstalledPacks | Where-Object { $_ -ne 'gpu' })
         if (@(Get-InstalledPacks) -contains 'gpu') { Save-InstalledPacks $withoutGpu }
     }
-    if (-not (Start-HostBridge)) {
-        [Console]::Error.WriteLine('LOCALAI_DOCKER_NOT_READY code=19 reason=host interoperability bridge failed to start')
-        return $Exit.External
+    try { $script:HostBridgeAvailable = [bool](Start-HostBridge) }
+    catch {
+        $script:HostBridgeAvailable = $false
+        Write-RunProgress "optional host interoperability bridge failed: $($_.Exception.Message)"
     }
+    if (-not $HostBridgeAvailable) { Write-RunProgress 'optional host interoperability bridge is unavailable; core interactive mode will continue' }
     Write-RunProgress 'creating target-local runtime credentials and environment'
     Ensure-RuntimeEnv -ModelId $modelId
     $config = Invoke-ComposeLive $Name @('config', '--quiet') 'Compose validation'
@@ -902,7 +909,7 @@ function Install-Core {
     if ($up.ExitCode -ne 0) { [Console]::Error.WriteLine($up.Output); return $Exit.Install }
     $ready = Wait-ForGateway
     if ($null -eq $ready) { [Console]::Error.WriteLine('Gateway did not become healthy.'); return $Exit.Server }
-    $body = @{ model = $modelId; messages = @(@{ role = 'user'; content = 'Reply with exactly LOCALAI_CORE_OK.' }); stream = $false } | ConvertTo-Json -Depth 8
+    $body = @{ model = $modelId; messages = @(@{ role = 'user'; content = 'Reply with exactly LOCALAI_CORE_OK.' }); temperature = 0; stream = $false } | ConvertTo-Json -Depth 8
     Write-RunProgress 'authenticated smoke inference started'
     $answer = Invoke-ApiLive '/v1/chat/completions' $body -Authenticated -Label 'authenticated core smoke inference'
     if ($null -eq $answer) { [Console]::Error.WriteLine('Authenticated core inference failed.'); return $Exit.Server }
@@ -958,7 +965,8 @@ function Install-Core {
     Write-AtomicText $receiptPath $jsonText
     Write-AtomicText (Join-Path $StateRoot 'current-deployment.json') $jsonText
     $containerState = 'recreated'
-    [Console]::Out.WriteLine("LOCALAI_DOCKER_READY backend=$Name app=running containers=$containerState deployment=$($deployment.deployment_id)")
+    $bridgeState = if ($HostBridgeAvailable) { 'ready' } else { 'unavailable' }
+    [Console]::Out.WriteLine("LOCALAI_DOCKER_READY backend=$Name host_bridge=$bridgeState app=running containers=$containerState deployment=$($deployment.deployment_id)")
     Write-RunProgress "$Operation finished with verified core inference and committed deployment"
     return 0
 }
@@ -1061,7 +1069,7 @@ function Invoke-ProfileBenchmark {
     $profile = $profiles.profiles.$ProfileName
     if ($null -eq $profile) { return [pscustomobject]@{ Passed = $false; Reason = "Profile is not defined: $ProfileName" } }
     $marker = 'LOCALAI_PROFILE_BENCHMARK_OK'
-    $body = @{ model = $ModelId; messages = @(@{ role = 'user'; content = "Reply with exactly $marker and nothing else." }); max_tokens = 16; stream = $false } | ConvertTo-Json -Depth 8
+    $body = @{ model = $ModelId; messages = @(@{ role = 'user'; content = "Reply with exactly $marker and nothing else." }); temperature = 0; max_tokens = 16; stream = $false } | ConvertTo-Json -Depth 8
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $response = Invoke-ApiLive '/v1/chat/completions' $body -Authenticated -Label "$ProfileName profile benchmark" -TimeoutSeconds 180 -ExtraUsage
     $clock.Stop()
@@ -1103,7 +1111,8 @@ function Start-Interactive {
     if (-not $status.Ready) { Show-Status $status; return $status.Code }
     $modelId = [string]$status.Receipt.model_id
     Write-RunProgress "interactive mode starting backend=$Name model=$modelId"
-    [Console]::Out.WriteLine("LOCALAI_INTERACTIVE_READY backend=$Name model=$modelId endpoint=http://127.0.0.1:8080")
+    $bridgeState = if ($status.PSObject.Properties.Name -contains 'HostBridgeAvailable' -and $status.HostBridgeAvailable) { 'ready' } else { 'unavailable' }
+    [Console]::Out.WriteLine("LOCALAI_INTERACTIVE_READY backend=$Name model=$modelId host_bridge=$bridgeState endpoint=http://127.0.0.1:8080")
     [Console]::Out.WriteLine('Type /help for commands, /exit to stop. Enter a message to chat.')
     while ($true) {
         try {

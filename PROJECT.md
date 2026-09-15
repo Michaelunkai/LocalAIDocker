@@ -21,7 +21,7 @@ There is one active model deployment. Model switching requires an explicit opera
 
 ## Authority contract
 
-Core containers do not receive the host Docker socket, host credentials, arbitrary host paths, or unrestricted network access. The agent policy is typed and capability-driven. Explicit file writes are limited to the project through the authenticated host bridge, and structured commands use argv arrays without shell parsing. Core also supports explicit read-only Windows inspection and a narrowly scoped Chrome URL-launch receipt; it never claims browser observation or signed-in control. Coding, media, documents, research, and the isolated Chromium browser are installable packs with executable smoke probes; nested-container and harness services remain unavailable until their isolation and image acceptance proofs are present.
+Core containers do not receive the host Docker socket, host credentials, arbitrary host paths, or unrestricted network access. The agent policy is typed and capability-driven. Workspace writes stay inside the target-local workspace; optional Windows-drive inspection, project writes through the authenticated host bridge, and narrowly scoped Chrome URL-launch receipts are exposed only while that bridge is healthy. Core inference and interactive chat remain ready if the bridge is unavailable, and the agent reports those host capabilities as unavailable rather than claiming them. Coding, media, documents, research, and the isolated Chromium browser are installable packs with executable smoke probes; nested-container and harness services remain unavailable until their isolation and image acceptance proofs are present.
 
 ## Backend contract
 

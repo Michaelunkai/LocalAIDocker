@@ -95,6 +95,17 @@ class DirectIntentTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 browser_service._public_url("https://example.test/")
 
+    def test_host_tools_are_not_advertised_without_a_healthy_bridge(self) -> None:
+        with patch.dict("os.environ", {"HOST_BRIDGE_AVAILABLE": "0"}, clear=False):
+            names = {item["name"] for item in tool_registry.enabled_tools({"core"})}
+        self.assertNotIn("list_windows_directories", names)
+        self.assertNotIn("open_default_browser", names)
+
+        with patch.dict("os.environ", {"HOST_BRIDGE_AVAILABLE": "1"}, clear=False):
+            names = {item["name"] for item in tool_registry.enabled_tools({"core"})}
+        self.assertIn("list_windows_directories", names)
+        self.assertIn("open_default_browser", names)
+
 
 if __name__ == "__main__":
     unittest.main()

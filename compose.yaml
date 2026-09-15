@@ -102,6 +102,7 @@ services:
       HOST_BRIDGE_URL: http://gateway:8080/host-bridge
       HOST_BRIDGE_KEY_FILE: /run/secrets/host_bridge_key
       AGENT_PACKS: ${AGENT_PACKS:-core}
+      HOST_BRIDGE_AVAILABLE: ${HOST_BRIDGE_AVAILABLE:-0}
     secrets:
       - host_bridge_key
     depends_on:

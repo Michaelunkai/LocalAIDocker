@@ -188,6 +188,8 @@ def enabled_tools(installed_packs: set[str]) -> list[dict[str, Any]]:
     for spec in REGISTRY.values():
         if spec.pack != "core" and spec.pack not in installed_packs:
             continue
+        if spec.network == "host-local" and os.environ.get("HOST_BRIDGE_AVAILABLE", "0") != "1":
+            continue
         result.append(spec.manifest())
     return result
 
@@ -430,6 +432,9 @@ def _toolchain_status(pack: str) -> dict[str, Any]:
 def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if name not in REGISTRY:
         raise PolicyError(f"unknown tool: {name}")
+    spec = REGISTRY[name]
+    if spec.network == "host-local" and os.environ.get("HOST_BRIDGE_AVAILABLE", "0") != "1":
+        raise PolicyError("host interoperability bridge is unavailable")
     if name == "read_file":
         return _read_workspace_file(arguments)
     if name == "write_file":

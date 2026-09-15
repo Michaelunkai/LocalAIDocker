@@ -98,10 +98,13 @@ the prompt. `-Launch` without task text enters the same mode; passing task text
 keeps one-shot behavior.
 
 Interactive requests are routed through the authenticated agent service, not
-directly to the language model. The core agent can prove its deployment model,
-list directories on the configured Windows read-only drive, read bounded
-Windows files, list a bounded Windows process snapshot, and read and write its
-target-local workspace atomically. Large recursive scans write the complete
+directly to the language model. The core agent can always prove its deployment
+model and read/write its target-local workspace atomically. When the optional
+target-local host bridge is healthy, it can also list directories on the
+configured Windows read-only drive, read bounded Windows files, list a bounded
+Windows process snapshot, and launch an explicit Chrome URL. If that bridge is
+unavailable, core inference still enters interactive mode and those host
+capabilities are reported as unavailable. Large recursive scans write the complete
 discovered path stream under `evidence\` and report whether enumeration or
 terminal display was truncated. An explicit request naming Chrome/default
 browser can launch a URL as a new Chrome tab through the authenticated,

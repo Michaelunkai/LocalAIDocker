@@ -7,7 +7,7 @@ smoke-tested, and recorded in `state\current-deployment.json`.
 
 | Pack | Isolation | Current behavior |
 | --- | --- | --- |
-| core | LocalAI, gateway, agent, and target-local bridge | Text inference, bounded agent tasks, target-local writes, read-only Windows inspection, structured commands, and explicit Chrome URL launch receipts |
+| core | LocalAI, gateway, and agent; host bridge optional | Text inference, bounded agent tasks, target-local workspace writes, and structured commands. Windows inspection, project writes through the bridge, and explicit Chrome URL launch receipts appear only when the authenticated bridge is healthy. |
 | gpu | Native Linux Docker context only | Requires a verified NVIDIA Container Toolkit path; never claimed on Hyper-V CPU |
 | coding | Agent image | Git, ripgrep, C/C++ build tools, Node, Go, Rust, and Java smoke-tested when installed |
 | media | Agent image | ffmpeg and ImageMagick smoke-tested when installed |
