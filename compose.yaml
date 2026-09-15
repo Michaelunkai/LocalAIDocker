@@ -122,6 +122,7 @@ services:
     environment:
       MODEL_LOCK_FILE: /app/config/models.lock.json
       MODEL_OUTPUT_DIR: /models
+      MODEL_ID: ${MODEL_ID:?Selected model is not configured}
     volumes:
       - ./config/models.lock.json:/app/config/models.lock.json:ro
       - ./data/models:/models

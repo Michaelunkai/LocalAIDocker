@@ -107,7 +107,7 @@ def _direct_intent(message: str) -> tuple[str, dict[str, Any]] | None:
         # host-local launch request. It is intentionally separate from the
         # isolated browser pack: a launch receipt cannot claim tab observation
         # or signed-in control.
-        if any(term in lowered for term in ("default", "chrome", "new tab")):
+        if any(term in lowered for term in ("default", "chrome", "new tab")) or not any(term in lowered for term in ("isolated", "dom", "observe", "extract")):
             return "open_default_browser", {"url": url, "new_tab": True}
         if "browser" not in _packs():
             raise PolicyError("the isolated browser pack is not installed")

@@ -383,6 +383,7 @@ function Start-HostBridge {
 }
 
 function Ensure-RuntimeEnv {
+    param([string]$ModelId)
     Ensure-Secret
     if ((Get-InstalledPacks) -contains 'browser') { Ensure-BrowserSecret }
     $lock = Read-JsonFile (Join-Path $ConfigRoot 'runtime.lock.json')
@@ -392,6 +393,16 @@ function Ensure-RuntimeEnv {
     $installed = @(Get-InstalledPacks)
     $agentPacks = ($installed -join ',')
     $buildPacks = @($installed | Where-Object { $_ -in @('coding', 'media', 'documents') }) -join ','
+    if ([string]::IsNullOrWhiteSpace($ModelId)) {
+        $existingReceipt = Get-Receipt
+        if ($existingReceipt -and $existingReceipt.model_id) { $ModelId = [string]$existingReceipt.model_id }
+    }
+    if ([string]::IsNullOrWhiteSpace($ModelId)) {
+        $modelLock = Read-JsonFile (Join-Path $ConfigRoot 'models.lock.json')
+        $selected = @($modelLock.models | Where-Object { @($_.profiles) -contains $Profile } | Select-Object -First 1)
+        if ($selected.Count -ne 1) { throw "No verified model fits profile '$Profile'." }
+        $ModelId = [string]$selected[0].id
+    }
     $lines = @(
         "LOCALAI_IMAGE=$cpu",
         "LOCALAI_CPU_IMAGE=$cpu",
@@ -399,6 +410,8 @@ function Ensure-RuntimeEnv {
         "AGENT_BASE_IMAGE=$base",
         "AGENT_PACKS=$agentPacks",
         "INSTALL_PACKS=$buildPacks",
+        "MODEL_ID=$ModelId",
+        "MODEL_PROFILE=$Profile",
         "LOCALAI_API_KEY_FILE=./secrets/localai-api-key",
         "BROWSER_API_KEY_FILE=./secrets/browser-api-key"
     )
@@ -663,6 +676,13 @@ function Install-Core {
     Write-RunProgress "$Operation started backend=$Name"
     $backend = Test-Backend $Name
     if (-not $backend.Ready) { Show-Status $backend; return $backend.Code }
+    $modelLock = Read-JsonFile (Join-Path $ConfigRoot 'models.lock.json')
+    $modelEntry = @($modelLock.models | Where-Object { @($_.profiles) -contains $Profile } | Select-Object -First 1)
+    if ($modelEntry.Count -ne 1) {
+        [Console]::Error.WriteLine("No verified model fits profile '$Profile'.")
+        return $Exit.Model
+    }
+    $modelId = [string]$modelEntry[0].id
     if ($Name -ne 'native-linux-gpu') {
         $withoutGpu = @(Get-InstalledPacks | Where-Object { $_ -ne 'gpu' })
         if (@(Get-InstalledPacks) -contains 'gpu') { Save-InstalledPacks $withoutGpu }
@@ -672,7 +692,7 @@ function Install-Core {
         return $Exit.External
     }
     Write-RunProgress 'creating target-local runtime credentials and environment'
-    Ensure-RuntimeEnv
+    Ensure-RuntimeEnv -ModelId $modelId
     $config = Invoke-ComposeLive $Name @('config', '--quiet') 'Compose validation'
     if ($config.ExitCode -ne 0) { [Console]::Error.WriteLine($config.Output); return $Exit.Install }
     $pull = $null
@@ -693,20 +713,15 @@ function Install-Core {
     if (-not $images.Ready) { [Console]::Error.WriteLine($images.Reason); return $Exit.Provenance }
     $model = Invoke-ComposeLive $Name @('--profile', 'install', 'run', '--rm', 'model-manager') 'locked model and data verification'
     if ($model.ExitCode -ne 0) { [Console]::Error.WriteLine($model.Output); return $Exit.Model }
-    $upCommand = @('up', '-d')
-    if ($ForceRecreate) { $upCommand += '--force-recreate' }
+    # The selected model configuration is promoted immediately before this
+    # step. Recreate every application container so a model/profile change can
+    # never leave a healthy-looking server running the previous model.
+    $upCommand = @('up', '-d', '--force-recreate')
     $upCommand += @('--pull', 'never', '--no-build') + (Get-AppServices)
     $up = Invoke-ComposeLive $Name $upCommand 'Docker application start and container recreation'
     if ($up.ExitCode -ne 0) { [Console]::Error.WriteLine($up.Output); return $Exit.Install }
     $ready = Wait-ForGateway
     if ($null -eq $ready) { [Console]::Error.WriteLine('Gateway did not become healthy.'); return $Exit.Server }
-    $modelLock = Read-JsonFile (Join-Path $ConfigRoot 'models.lock.json')
-    $modelEntry = @($modelLock.models | Where-Object { @($_.profiles) -contains $Profile } | Select-Object -First 1)
-    if ($modelEntry.Count -ne 1) {
-        [Console]::Error.WriteLine("No verified model fits profile '$Profile'.")
-        return $Exit.Model
-    }
-    $modelId = [string]$modelEntry[0].id
     $body = @{ model = $modelId; messages = @(@{ role = 'user'; content = 'Reply with exactly LOCALAI_CORE_OK.' }); stream = $false } | ConvertTo-Json -Depth 8
     Write-RunProgress 'authenticated smoke inference started'
     $answer = Invoke-ApiLive '/v1/chat/completions' $body -Authenticated -Label 'authenticated core smoke inference'

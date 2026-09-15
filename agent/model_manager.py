@@ -109,6 +109,42 @@ def write_atomic_text(target: pathlib.Path, text: str) -> None:
             os.unlink(temp_name)
 
 
+def selected_models(lock: dict) -> list[dict]:
+    requested_id = os.environ.get("MODEL_ID", "").strip()
+    if requested_id:
+        selected = [model for model in lock["models"] if str(model.get("id", "")) == requested_id]
+        if len(selected) != 1:
+            raise RuntimeError(f"MODEL_ID is not present exactly once in the model lock: {requested_id}")
+        return selected
+    profile = os.environ.get("MODEL_PROFILE", "").strip().lower()
+    if profile:
+        selected = [model for model in lock["models"] if profile in model.get("profiles", [])]
+        if len(selected) == 1:
+            return selected
+        if len(selected) > 1:
+            raise RuntimeError(f"MODEL_PROFILE is ambiguous; set MODEL_ID explicitly: {profile}")
+        raise RuntimeError(f"no locked model is available for profile: {profile}")
+    if len(lock["models"]) != 1:
+        raise RuntimeError("MODEL_ID is required when the model lock contains multiple candidates")
+    return list(lock["models"])
+
+
+def model_config(model: dict, main_artifact: dict) -> str:
+    return "\n".join([
+        f"name: {model['id']}",
+        "backend: llama-cpp",
+        "parameters:",
+        f"  model: {model['id']}/{main_artifact['filename']}",
+        "context_size: 4096",
+        "threads: 8",
+        "template:",
+        "  use_tokenizer_template: true",
+        "options:",
+        "  - use_jinja:true",
+        "",
+    ])
+
+
 def validate_lock(lock: dict) -> None:
     if not isinstance(lock, dict) or not isinstance(lock.get("models"), list) or not lock["models"]:
         raise RuntimeError("model lock does not contain any candidates")
@@ -142,7 +178,7 @@ def main() -> None:
     output = pathlib.Path(os.environ.get("MODEL_OUTPUT_DIR", "/models"))
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
     validate_lock(lock)
-    for model in lock.get("models", []):
+    for model in selected_models(lock):
         model_dir = output / model["id"]
         model_dir.mkdir(parents=True, exist_ok=True)
         for artifact in model.get("artifacts", []):
@@ -157,20 +193,17 @@ def main() -> None:
                     continue
             download(artifact["url"], target, artifact["size_bytes"], artifact["sha256"])
         main_artifact = next(item for item in model["artifacts"] if item["role"] == "main")
-        config = "\n".join([
-            f"name: {model['id']}",
-            "backend: llama-cpp",
-            "parameters:",
-            f"  model: {model['id']}/{main_artifact['filename']}",
-            "context_size: 4096",
-            "threads: 8",
-            "template:",
-            "  use_tokenizer_template: true",
-            "options:",
-            "  - use_jinja:true",
-            "",
-        ])
-        write_atomic_text(output / f"{model['id']}.yaml", config)
+        final_config = output / f"{model['id']}.yaml"
+        pending_config = output / f".{model['id']}.yaml.pending"
+        write_atomic_text(pending_config, model_config(model, main_artifact))
+        # Artifacts remain durable for rollback, but only the selected locked
+        # candidate gets a root-level LocalAI configuration. This keeps one
+        # active model while avoiding deletion of unrelated user files.
+        locked_ids = {str(item["id"]) for item in lock["models"]}
+        for stale_config in output.glob("*.yaml"):
+            if stale_config.stem in locked_ids and stale_config != final_config:
+                stale_config.unlink()
+        os.replace(pending_config, final_config)
         print(f"MODEL_VERIFIED id={model['id']}")
 
 
