@@ -1,0 +1,7 @@
+services:
+  harness:
+    image: ${HARNESS_IMAGE:?Harness pack image must be explicitly locked}
+    profiles: ["harness"]
+    command: ["sleep", "infinity"]
+    networks: [inference]
+

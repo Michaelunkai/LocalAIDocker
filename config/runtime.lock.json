@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "platform": "linux/amd64",
+  "images": {
+    "localai_cpu": {
+      "source_ref": "localai/localai",
+      "tag": "locked-by-digest",
+      "digest": "sha256:b9fb7ed9888ef401d49002dc3227686d39339b7f487ee5ff40cd2bd82191f271",
+      "verified_at": "2026-09-15",
+      "purpose": "local Hyper-V CPU fallback"
+    },
+    "localai_gpu": {
+      "source_ref": "localai/localai",
+      "tag": "locked-by-digest",
+      "digest": "sha256:9556115962a2efe16511cac2832a3f9b3a14c5fae276b65d6bdea10957986c11",
+      "verified_at": "2026-09-15",
+      "purpose": "native Linux NVIDIA GPU runtime"
+    },
+    "agent_base": {
+      "source_ref": "python:3.12-slim",
+      "digest": "sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea",
+      "verified_at": "2026-09-15",
+      "purpose": "pinned agent build base"
+    }
+  },
+  "llama_cpp_backend": {
+    "provider": "LocalAI image",
+    "backend": "llama-cpp",
+    "verification": "runtime health plus inference benchmark"
+  },
+  "gpu_probe_image": {
+    "source_ref": "nvidia/cuda:12.8.0-base-ubuntu24.04",
+    "digest": "sha256:e778509d37d66475120929671500377524f7278478ba08131b07ef3ffcc0dce0"
+  }
+}

@@ -1,0 +1,13 @@
+services:
+  localai:
+    volumes:
+      - type: bind
+        source: ./data/models
+        target: /models
+      - type: bind
+        source: ./data/localai
+        target: /data
+  model-manager:
+    volumes:
+      - ./config/models.lock.json:/app/config/models.lock.json:ro
+      - ./data/models:/models

@@ -1,0 +1,9 @@
+services:
+  agent:
+    networks:
+      - inference
+      - research
+
+networks:
+  research:
+    internal: false

@@ -1,0 +1,143 @@
+name: localaidocker
+
+services:
+  localai:
+    image: ${LOCALAI_IMAGE:?Run scripts/llm.ps1 -Install first}
+    restart: unless-stopped
+    environment:
+      MODELS_PATH: /models
+      THREADS: ${LOCALAI_THREADS:-8}
+      CONTEXT_SIZE: ${LOCALAI_CONTEXT_SIZE:-4096}
+      DEBUG: ${LOCALAI_DEBUG:-false}
+    volumes:
+      - type: bind
+        source: ./data/models
+        target: /models
+      - type: bind
+        source: ./data/localai
+        target: /data
+    networks:
+      - inference
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --max-time 3 http://127.0.0.1:8080/readyz >/dev/null 2>&1 || curl -fsS --max-time 3 http://127.0.0.1:8080/healthz >/dev/null 2>&1 || curl -fsS --max-time 3 http://127.0.0.1:8080/health >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    # LocalAI dynamically loads its selected llama.cpp backend executable.
+    # Keep the service unprivileged and network-scoped, but do not make the
+    # image filesystem read-only because that prevents backend execution on
+    # Docker Desktop's Linux engine.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+
+  gateway:
+    image: localaidocker/gateway:locked
+    build:
+      context: .
+      dockerfile: docker/agent/Dockerfile
+      args:
+        BASE_IMAGE: ${AGENT_BASE_IMAGE:?Run scripts/llm.ps1 -Install first}
+        INSTALL_PACKS: ${INSTALL_PACKS:-}
+    command: ["python", "-m", "agent.gateway"]
+    environment:
+      LOCALAI_URL: http://localai:8080
+      AGENT_URL: http://agent:8090
+      API_KEY_FILE: /run/secrets/localai_api_key
+      HOST_BRIDGE_KEY_FILE: /run/secrets/host_bridge_key
+      HOST_BRIDGE_URL: http://host.docker.internal:8765
+      GATEWAY_BIND: 0.0.0.0:8080
+    secrets:
+      - localai_api_key
+      - host_bridge_key
+    depends_on:
+      localai:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - inference
+      - frontend
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  agent:
+    image: localaidocker/agent:locked
+    build:
+      context: .
+      dockerfile: docker/agent/Dockerfile
+      args:
+        BASE_IMAGE: ${AGENT_BASE_IMAGE:?Run scripts/llm.ps1 -Install first}
+        INSTALL_PACKS: ${INSTALL_PACKS:-}
+    command: ["python", "-m", "agent.nature_agent"]
+    environment:
+      LOCALAI_URL: http://localai:8080
+      AGENT_BIND: 0.0.0.0:8090
+      POLICY_FILE: /app/config/policy.json
+      VERIFIED_MODEL_STATE_FILE: /app/deployment-state/current-deployment.json
+      TASK_STATE_ROOT: /app/task-state
+      HOST_BRIDGE_URL: http://gateway:8080/host-bridge
+      HOST_BRIDGE_KEY_FILE: /run/secrets/host_bridge_key
+      AGENT_PACKS: ${AGENT_PACKS:-core}
+    secrets:
+      - host_bridge_key
+    depends_on:
+      localai:
+        condition: service_healthy
+    expose:
+      - "8090"
+    networks:
+      - inference
+    volumes:
+      - ./config/policy.json:/app/config/policy.json:ro
+      - ./state:/app/deployment-state:ro
+      - ./state/task-state:/app/task-state
+      - ./data:/workspace
+      - ./logs:/app/logs
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+
+  model-manager:
+    image: localaidocker/model-manager:locked
+    build:
+      context: .
+      dockerfile: docker/model-manager/Dockerfile
+      args:
+        BASE_IMAGE: ${AGENT_BASE_IMAGE:?Run scripts/llm.ps1 -Install first}
+    profiles: ["install"]
+    command: ["python", "-m", "agent.model_manager"]
+    environment:
+      MODEL_LOCK_FILE: /app/config/models.lock.json
+      MODEL_OUTPUT_DIR: /models
+    volumes:
+      - ./config/models.lock.json:/app/config/models.lock.json:ro
+      - ./data/models:/models
+    networks:
+      - download
+
+networks:
+  inference:
+    internal: true
+  download:
+    internal: false
+  frontend:
+    internal: false
+
+secrets:
+  localai_api_key:
+    file: ./secrets/localai-api-key
+  host_bridge_key:
+    file: ./secrets/host-bridge-key

@@ -1,0 +1,7 @@
+services:
+  nested-tools:
+    image: ${CONTAINERS_IMAGE:?Containers pack image must be explicitly locked}
+    profiles: ["containers"]
+    command: ["sleep", "infinity"]
+    networks: [inference]
+

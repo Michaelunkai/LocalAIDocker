@@ -1,0 +1,9 @@
+services:
+  document-tools:
+    image: ${DOCUMENTS_IMAGE:?Documents pack image must be explicitly locked}
+    profiles: ["documents"]
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./data:/workspace
+    networks: [inference]
+

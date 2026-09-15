@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+secrets/*
+data/models/*
+data/cache/*
+data/deployments/*
+state/*
+logs/*
+evidence/*
+backups/*
+__pycache__/
+*.pyc
+

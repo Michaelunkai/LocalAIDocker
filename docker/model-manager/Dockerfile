@@ -1,0 +1,9 @@
+ARG BASE_IMAGE=python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+FROM ${BASE_IMAGE}
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY agent /app/agent
+COPY config/models.lock.json /app/config/models.lock.json
+RUN python -m compileall -q /app/agent
+

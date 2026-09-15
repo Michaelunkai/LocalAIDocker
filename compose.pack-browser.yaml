@@ -1,0 +1,51 @@
+services:
+  browser:
+    image: localaidocker/browser:locked
+    build:
+      context: .
+      dockerfile: docker/browser/Dockerfile
+      args:
+        BASE_IMAGE: ${AGENT_BASE_IMAGE:?Run scripts/llm.ps1 -Install first}
+    environment:
+      BROWSER_BIND: 0.0.0.0:8787
+      BROWSER_API_KEY_FILE: /run/secrets/browser_api_key
+    secrets:
+      - browser_api_key
+    expose:
+      - "8787"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    networks:
+      - browser
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
+      - /home/browser:rw,noexec,nosuid,size=256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+
+  agent:
+    networks:
+      - inference
+      - browser
+    environment:
+      BROWSER_URL: http://browser:8787
+      BROWSER_API_KEY_FILE: /run/secrets/browser_api_key
+    secrets:
+      - browser_api_key
+    depends_on:
+      browser:
+        condition: service_healthy
+
+networks:
+  browser:
+    internal: false
+
+secrets:
+  browser_api_key:
+    file: ./secrets/browser-api-key

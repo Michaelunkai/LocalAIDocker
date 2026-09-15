@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "allowed_backends": ["hyperv-cpu", "native-linux-gpu"],
+  "default_backend": "hyperv-cpu",
+  "require_explicit_backend": true,
+  "allow_automatic_context_switch": false,
+  "gpu_requires_native_linux": true,
+  "bind_host": "127.0.0.1",
+  "bind_port": 8080
+}
+

@@ -1,0 +1,8 @@
+services:
+  localai:
+    image: ${LOCALAI_GPU_IMAGE:?GPU image is not configured}
+    gpus: all
+    environment:
+      GPU_LAYERS: ${LOCALAI_GPU_LAYERS:-999}
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+

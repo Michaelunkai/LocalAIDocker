@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "id": "qwen25-coder-1.5b-q4km",
+      "repo_id": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
+      "revision": "f86cb2c1fa58255f8052cc32aeede1b7482d4361",
+      "license": "apache-2.0",
+      "gated": false,
+      "architecture": "qwen2",
+      "quantization": "Q4_K_M",
+      "capabilities": ["text", "coding", "tool_calling"],
+      "artifacts": [
+        {
+          "role": "main",
+          "filename": "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+          "size_bytes": 1117320768,
+          "sha256": "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046",
+          "url": "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/f86cb2c1fa58255f8052cc32aeede1b7482d4361/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
+        }
+      ],
+      "fit": {
+        "minimum_ram_mib": 4096,
+        "recommended_vram_mib": 4096,
+        "minimum_context": 4096
+      },
+      "server": {
+        "requires_jinja": false,
+        "supports_tools": true,
+        "supports_vision": false
+      },
+      "profiles": ["fast", "coding"]
+    }
+  ]
+}

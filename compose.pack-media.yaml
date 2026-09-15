@@ -1,0 +1,9 @@
+services:
+  media-tools:
+    image: ${MEDIA_IMAGE:?Media pack image must be explicitly locked}
+    profiles: ["media"]
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./data:/workspace
+    networks: [inference]
+

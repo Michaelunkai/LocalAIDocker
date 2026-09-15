@@ -1,0 +1,14 @@
+services:
+  coding-tools:
+    image: ${CODING_IMAGE:-python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea}
+    profiles: ["coding"]
+    command: ["sleep", "infinity"]
+    working_dir: /workspace
+    volumes:
+      - ./data:/workspace
+    networks: [inference]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
