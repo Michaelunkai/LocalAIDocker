@@ -153,6 +153,54 @@ function Invoke-CheckedDocker {
     }
 }
 
+function Test-AcceptanceBackendPolicy {
+    param([Parameter(Mandatory = $true)]$Info, [Parameter(Mandatory = $true)][string]$BackendName)
+    $contextResult = Invoke-CheckedDocker @('context', 'show')
+    $context = ([string]$contextResult.Output).Trim()
+    if ($contextResult.ExitCode -ne 0) {
+        return [pscustomobject]@{ Ready = $false; Context = $context; Reason = 'Docker context identity could not be verified.' }
+    }
+    if ([string]$Info.OSType -ne 'linux') {
+        return [pscustomobject]@{ Ready = $false; Context = $context; Reason = 'The selected Docker daemon is not a Linux container engine.' }
+    }
+    if ($BackendName -eq 'native-linux-gpu' -and $context -in @('default', 'desktop-linux')) {
+        return [pscustomobject]@{ Ready = $false; Context = $context; Reason = 'GPU acceptance requires an explicitly selected native Linux Docker context.' }
+    }
+    if ($BackendName -ne 'hyperv-cpu') {
+        return [pscustomobject]@{ Ready = $true; Context = $context; Reason = 'Selected backend is not the local Hyper-V CPU policy.' }
+    }
+
+    $settingsPaths = @(
+        (Join-Path $env:APPDATA 'Docker\settings-store.json'),
+        (Join-Path $env:LOCALAPPDATA 'Docker\settings-store.json'),
+        'C:\ProgramData\DockerDesktop\install-settings.json'
+    )
+    $settingFound = $false
+    $wslEngineEnabled = $null
+    foreach ($settingsPath in $settingsPaths) {
+        if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) { continue }
+        try {
+            $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+            $property = @($settings.PSObject.Properties | Where-Object { $_.Name -ieq 'WslEngineEnabled' }) | Select-Object -First 1
+            if ($null -ne $property) {
+                $settingFound = $true
+                $wslEngineEnabled = [bool]$property.Value
+                break
+            }
+        } catch { }
+    }
+    if ($settingFound -and $wslEngineEnabled) {
+        return [pscustomobject]@{ Ready = $false; Context = $context; Reason = 'Docker Desktop is configured with its WSL2 backend; runtime acceptance is not valid for this no-WSL2 project.' }
+    }
+    if ($settingFound -and -not $wslEngineEnabled) {
+        return [pscustomobject]@{ Ready = $true; Context = $context; Reason = 'Docker Desktop non-WSL backend is explicitly recorded.' }
+    }
+    if ($env:LOCALAI_HYPERV_VERIFIED -eq '1') {
+        return [pscustomobject]@{ Ready = $true; Context = $context; Reason = 'Hyper-V backend was explicitly asserted by the user environment.' }
+    }
+    return [pscustomobject]@{ Ready = $false; Context = $context; Reason = 'A non-WSL Docker Desktop backend is not proven; refusing to accept runtime behavior.' }
+}
+
 $docker = Get-AcceptanceDocker
 $receiptPath = Join-Path $root 'state\current-deployment.json'
 $runtimeEnv = Join-Path $root '.env.runtime'
@@ -175,6 +223,21 @@ if (-not $docker) {
         $installedPath = Join-Path $root 'state\installed-packs.json'
         if (Test-Path -LiteralPath $installedPath -PathType Leaf) {
             try { $installedPackNames = @((Get-Content -LiteralPath $installedPath -Raw | ConvertFrom-Json).packs | ForEach-Object { [string]$_ }) } catch { }
+        }
+        try { $infoObject = $info.Output | ConvertFrom-Json } catch { $infoObject = $null }
+        if ($null -eq $infoObject) {
+            Add-Result 'docker-backend-policy' 'unverified-external' 'Docker returned no parseable backend identity; runtime acceptance was skipped.'
+            Add-Result 'runtime-behavior' 'unverified-external' 'Runtime behavior cannot be accepted without a verified backend identity.'
+            if ($Json) { $results | ConvertTo-Json -Depth 8 } else { $results | Format-Table -AutoSize | Out-String | Write-Output }
+            exit 0
+        }
+        $backendPolicy = Test-AcceptanceBackendPolicy $infoObject $backendName
+        if ($backendPolicy.Ready) { Add-Result 'docker-backend-policy' 'passed' $backendPolicy.Reason }
+        else {
+            Add-Result 'docker-backend-policy' 'unverified-external' ($backendPolicy.Reason + ' context=' + $backendPolicy.Context)
+            Add-Result 'runtime-behavior' 'unverified-external' 'Runtime behavior was not probed because the selected Docker backend violates or does not prove the no-WSL2 policy.'
+            if ($Json) { $results | ConvertTo-Json -Depth 8 } else { $results | Format-Table -AutoSize | Out-String | Write-Output }
+            exit 0
         }
         $composeArgs = @('compose', '--env-file', $runtimeEnv, '-f', (Join-Path $root 'compose.yaml'))
         if ($backendName -eq 'native-linux-gpu') { $composeArgs += @('-f', (Join-Path $root 'compose.gpu.yaml')) } else { $composeArgs += @('-f', (Join-Path $root 'compose.cpu.yaml')) }
