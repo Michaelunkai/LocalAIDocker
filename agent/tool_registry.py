@@ -339,14 +339,19 @@ def _public_addresses(hostname: str, port: int) -> list[str]:
             parsed = ipaddress.ip_address(address)
         except ValueError as exc:
             raise PolicyError(f"research hostname returned an invalid address: {address}") from exc
+        # IPv4-mapped IPv6 addresses otherwise look like an IPv6 result while
+        # carrying an IPv4 private/loopback destination.  Apply the policy to
+        # the mapped IPv4 value as well, preventing a DNS result from bypassing
+        # the public-target check through ::ffff:x.x.x.x notation.
+        policy_address = getattr(parsed, "ipv4_mapped", None) or parsed
         if (
-            not parsed.is_global
-            or parsed.is_private
-            or parsed.is_loopback
-            or parsed.is_link_local
-            or parsed.is_multicast
-            or parsed.is_reserved
-            or parsed.is_unspecified
+            not policy_address.is_global
+            or policy_address.is_private
+            or policy_address.is_loopback
+            or policy_address.is_link_local
+            or policy_address.is_multicast
+            or policy_address.is_reserved
+            or policy_address.is_unspecified
         ):
             raise PolicyError(f"research target resolves to a non-public address: {address}")
         if address not in addresses:

@@ -42,7 +42,10 @@ def _public_url(value: str) -> str:
         raise ValueError("browser hostname did not resolve")
     for item in addresses:
         address = ipaddress.ip_address(item[4][0])
-        if not address.is_global or address.is_private or address.is_loopback or address.is_link_local:
+        # Treat IPv4-mapped IPv6 results as their underlying IPv4 address so
+        # loopback/private destinations cannot pass the browser SSRF check.
+        policy_address = getattr(address, "ipv4_mapped", None) or address
+        if not policy_address.is_global or policy_address.is_private or policy_address.is_loopback or policy_address.is_link_local or policy_address.is_multicast or policy_address.is_reserved or policy_address.is_unspecified:
             raise ValueError("browser target resolves to a non-public address")
     return parsed.geturl()
 

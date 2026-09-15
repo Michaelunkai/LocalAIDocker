@@ -1,6 +1,14 @@
 # LocalAIDocker generated state
 data/models/*
 !data/models/.gitkeep
+data/backends/*
+!data/backends/.gitkeep
+data/configuration/*
+!data/configuration/.gitkeep
+data/workspace/*
+!data/workspace/.gitkeep
+data/localai/*
+!data/localai/.gitkeep
 data/deployments/*
 !data/deployments/.gitkeep
 data/cache/*

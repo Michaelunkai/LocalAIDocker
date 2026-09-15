@@ -5,10 +5,9 @@ services:
     command: ["sleep", "infinity"]
     working_dir: /workspace
     volumes:
-      - ./data:/workspace
+      - ./data/workspace:/workspace
     networks: [inference]
     read_only: true
     tmpfs: [/tmp]
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
-

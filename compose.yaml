@@ -5,6 +5,14 @@ services:
     image: ${LOCALAI_IMAGE:?Run scripts/llm.ps1 -Install first}
     restart: unless-stopped
     environment:
+      # Keep all LocalAI-owned mutable stores on target-local bind mounts so
+      # a forced container recreation does not discard backends, configuration,
+      # or application data.  The LOCALAI_* spellings are the canonical
+      # LocalAI variables; the short aliases remain for older image builds.
+      LOCALAI_MODELS_PATH: /models
+      LOCALAI_BACKENDS_PATH: /backends
+      LOCALAI_CONFIG_DIR: /configuration
+      LOCALAI_DATA_PATH: /data
       MODELS_PATH: /models
       THREADS: ${LOCALAI_THREADS:-8}
       CONTEXT_SIZE: ${LOCALAI_CONTEXT_SIZE:-4096}
@@ -13,6 +21,12 @@ services:
       - type: bind
         source: ./data/models
         target: /models
+      - type: bind
+        source: ./data/backends
+        target: /backends
+      - type: bind
+        source: ./data/configuration
+        target: /configuration
       - type: bind
         source: ./data/localai
         target: /data
@@ -101,7 +115,10 @@ services:
       - ./config/policy.json:/app/config/policy.json:ro
       - ./state:/app/deployment-state:ro
       - ./state/task-state:/app/task-state
-      - ./data:/workspace
+      # The agent's editable workspace is deliberately separate from model,
+      # backend, configuration, and deployment stores.  This prevents a
+      # normal file tool from treating runtime internals as user documents.
+      - ./data/workspace:/workspace
       - ./logs:/app/logs
     read_only: true
     tmpfs:
@@ -122,7 +139,12 @@ services:
     environment:
       MODEL_LOCK_FILE: /app/config/models.lock.json
       MODEL_OUTPUT_DIR: /models
-      MODEL_ID: ${MODEL_ID:?Selected model is not configured}
+      # Compose expands environment expressions for every service during
+      # `config`, even when the install-only profile is not selected.  Keep
+      # read-only checks usable with a receipt produced by an older launcher;
+      # model_manager.py still rejects an empty value when this service is
+      # actually run, and the installer writes the selected locked ID first.
+      MODEL_ID: ${MODEL_ID:-}
     volumes:
       - ./config/models.lock.json:/app/config/models.lock.json:ro
       - ./data/models:/models

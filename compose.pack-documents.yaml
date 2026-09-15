@@ -4,6 +4,5 @@ services:
     profiles: ["documents"]
     command: ["sleep", "infinity"]
     volumes:
-      - ./data:/workspace
+      - ./data/workspace:/workspace
     networks: [inference]
-

@@ -1,8 +1,11 @@
 import unittest
+import socket
 from unittest.mock import patch
 
 from agent import nature_agent
 from agent import model_manager
+from agent import browser_service
+from agent import tool_registry
 
 
 class DirectIntentTests(unittest.TestCase):
@@ -79,6 +82,18 @@ class DirectIntentTests(unittest.TestCase):
             self.assertEqual(model_manager.selected_models(lock)[0]["id"], "quality")
         with patch.dict("os.environ", {"MODEL_ID": "", "MODEL_PROFILE": "quality"}, clear=False):
             self.assertEqual(model_manager.selected_models(lock)[0]["id"], "quality")
+
+    def test_research_rejects_private_ipv4_mapped_ipv6_result(self) -> None:
+        result = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::ffff:127.0.0.1", 80, 0, 0))]
+        with patch.object(socket, "getaddrinfo", return_value=result):
+            with self.assertRaises(tool_registry.PolicyError):
+                tool_registry._public_addresses("example.test", 80)
+
+    def test_isolated_browser_rejects_private_ipv4_mapped_ipv6_result(self) -> None:
+        result = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::ffff:127.0.0.1", 443, 0, 0))]
+        with patch.object(browser_service.socket, "getaddrinfo", return_value=result):
+            with self.assertRaises(ValueError):
+                browser_service._public_url("https://example.test/")
 
 
 if __name__ == "__main__":

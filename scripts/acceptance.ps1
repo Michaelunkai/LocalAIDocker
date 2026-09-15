@@ -80,13 +80,23 @@ try {
 $python = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($python) {
     $previousPythonPath = $env:PYTHONPATH
+    $unitExitCode = 1
     Push-Location $root
     try {
         $env:PYTHONPATH = $root
-        $unitOutput = @(& $python.Source -m unittest discover -s tests -p 'test_*.py' 2>&1)
-        if ($LASTEXITCODE -eq 0) { Add-Result 'agent-unit-tests' 'passed' 'Direct intent and policy routing tests passed.' }
-        else { Add-Result 'agent-unit-tests' 'failed' (($unitOutput -join "`n").Trim()) }
-    } catch { Add-Result 'agent-unit-tests' 'failed' $_.Exception.Message }
+        # unittest writes its progress stream to stderr.  With the script's
+        # global Stop preference, PowerShell 5.1 turns that redirected native
+        # stream into a terminating RemoteException before the exit code can
+        # be inspected.  Preserve the output but temporarily allow native
+        # stderr while the child process is running.
+        $previousUnitErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try { $unitOutput = @(& $python.Source -m unittest discover -s tests -p 'test_*.py' 2>&1) }
+        finally { $ErrorActionPreference = $previousUnitErrorAction }
+        $unitExitCode = [int]$LASTEXITCODE
+        if ($unitExitCode -eq 0) { Add-Result 'agent-unit-tests' 'passed' 'Direct intent and policy routing tests passed.' }
+        else { Add-Result 'agent-unit-tests' 'failed' ("exit=$unitExitCode " + (($unitOutput -join "`n").Trim())) }
+    } catch { Add-Result 'agent-unit-tests' 'failed' ("exit=$unitExitCode " + $_.Exception.ToString()) }
     finally {
         Pop-Location
         if ($null -eq $previousPythonPath) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $previousPythonPath }
@@ -94,8 +104,10 @@ if ($python) {
 } else { Add-Result 'agent-unit-tests' 'unverified-external' 'Python executable unavailable.' }
 
 function Get-AcceptanceDocker {
-    $command = Get-Command docker.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($command -and $command.Source) { return [string]$command.Source }
+    foreach ($commandName in @('docker.exe', 'docker')) {
+        $command = Get-Command $commandName -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($command -and $command.Source) { return [string]$command.Source }
+    }
     foreach ($candidate in @(
             (Join-Path ${env:ProgramFiles} 'Docker\Docker\resources\bin\docker.exe'),
             (Join-Path ${env:ProgramFiles} 'Docker\Docker\resources\bin\com.docker.cli.exe'),

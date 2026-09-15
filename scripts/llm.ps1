@@ -77,9 +77,13 @@ function Write-RunProgress {
 
 function Get-DockerExecutable {
     $candidates = New-Object System.Collections.Generic.List[string]
-    $command = Get-Command docker.exe -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($command -and $command.Source) { [void]$candidates.Add([string]$command.Source) }
+    foreach ($commandName in @('docker.exe', 'docker')) {
+        $command = Get-Command $commandName -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($command -and $command.Source -and -not $candidates.Contains([string]$command.Source)) {
+            [void]$candidates.Add([string]$command.Source)
+        }
+    }
     foreach ($candidate in @(
             (Join-Path ${env:ProgramFiles} 'Docker\Docker\resources\bin\docker.exe'),
             (Join-Path ${env:ProgramFiles} 'Docker\Docker\resources\bin\com.docker.cli.exe'),
@@ -137,27 +141,93 @@ function Invoke-Docker {
     [pscustomobject]@{ Output = ($output -join "`n"); ExitCode = $code }
 }
 
+function ConvertTo-NativeProcessArgument {
+    param([AllowEmptyString()][string]$Value)
+    if ($null -eq $Value) { $Value = '' }
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+    $builder = New-Object Text.StringBuilder
+    [void]$builder.Append([char]34)
+    $slashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq [char]92) {
+            $slashes++
+            continue
+        }
+        if ($character -eq [char]34) {
+            if ($slashes -gt 0) { [void]$builder.Append([char]92, ($slashes * 2)) }
+            [void]$builder.Append([char]92)
+            [void]$builder.Append([char]34)
+            $slashes = 0
+            continue
+        }
+        if ($slashes -gt 0) { [void]$builder.Append([char]92, $slashes); $slashes = 0 }
+        [void]$builder.Append($character)
+    }
+    if ($slashes -gt 0) { [void]$builder.Append([char]92, ($slashes * 2)) }
+    [void]$builder.Append([char]34)
+    return $builder.ToString()
+}
+
 function Invoke-DockerLive {
     param(
         [Parameter(Mandatory = $true)][string[]]$Arguments,
-        [Parameter(Mandatory = $true)][string]$Stage
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [int]$TimeoutSeconds = 1800
     )
     $docker = Get-DockerExecutable
     $lines = New-Object System.Collections.Generic.List[string]
     $lastPrintedLine = ''
     $lastPrintedAt = -1000
+    $lastHeartbeatAt = 0
     $ansiPattern = ([string][char]27) + '\\[[0-?]*[ -/]*[@-~]'
-    Write-RunProgress "$Stage started"
-    $previousErrorAction = $ErrorActionPreference
-    $previousDockerTimeout = $env:DOCKER_CLIENT_TIMEOUT
-    $previousComposeTimeout = $env:COMPOSE_HTTP_TIMEOUT
-    $ErrorActionPreference = 'Continue'
-    $env:DOCKER_CLIENT_TIMEOUT = '10'
-    $env:COMPOSE_HTTP_TIMEOUT = '10'
+    $stateDirectory = Join-Path $ProjectRoot 'state'
+    New-Item -ItemType Directory -Path $stateDirectory -Force | Out-Null
+    $runId = [guid]::NewGuid().ToString('N')
+    $capturePath = Join-Path $ProjectRoot ('logs\.docker-' + $runId + '.log')
+    $process = $null
+    $stdoutQueue = New-Object Collections.Concurrent.ConcurrentQueue[string]
+    $stderrQueue = New-Object Collections.Concurrent.ConcurrentQueue[string]
+    $stdoutSubscription = $null
+    $stderrSubscription = $null
+    $code = 125
+    Write-RunProgress "$Stage started timeout_seconds=$TimeoutSeconds"
     try {
-        & $docker @Arguments 2>&1 | ForEach-Object {
-                $line = [regex]::Replace([string]$_, $ansiPattern, '') -replace "`r", ''
+        $startInfo = New-Object Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $docker
+        $startInfo.WorkingDirectory = $ProjectRoot
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
+        if ($null -ne $argumentListProperty) {
+            foreach ($argument in $Arguments) { [void]$startInfo.ArgumentList.Add([string]$argument) }
+        } else {
+            $startInfo.Arguments = (($Arguments | ForEach-Object { ConvertTo-NativeProcessArgument ([string]$_) }) -join ' ')
+        }
+        $startInfo.EnvironmentVariables['DOCKER_CLIENT_TIMEOUT'] = '10'
+        $startInfo.EnvironmentVariables['COMPOSE_HTTP_TIMEOUT'] = '10'
+        $process = New-Object Diagnostics.Process
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) { throw 'Docker process could not be started.' }
+        $stdoutSource = 'LocalAIDocker.' + $runId + '.stdout'
+        $stderrSource = 'LocalAIDocker.' + $runId + '.stderr'
+        $stdoutSubscription = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -SourceIdentifier $stdoutSource -MessageData $stdoutQueue -Action {
+            if ($null -ne $EventArgs.Data) { [void]$Event.MessageData.Enqueue([string]$EventArgs.Data) }
+        }
+        $stderrSubscription = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -SourceIdentifier $stderrSource -MessageData $stderrQueue -Action {
+            if ($null -ne $EventArgs.Data) { [void]$Event.MessageData.Enqueue([string]$EventArgs.Data) }
+        }
+        $process.BeginOutputReadLine()
+        $process.BeginErrorReadLine()
+        $started = [Diagnostics.Stopwatch]::StartNew()
+        while (-not $process.HasExited) {
+            $emitted = $false
+            $line = ''
+            while ($stdoutQueue.TryDequeue([ref]$line)) {
+                $line = [regex]::Replace([string]$line, $ansiPattern, '') -replace "`r", ''
                 [void]$lines.Add($line)
+                $emitted = $true
                 if (-not [string]::IsNullOrWhiteSpace($line)) {
                     $now = [int]$RunClock.Elapsed.TotalMilliseconds
                     $isTransferProgress = $line -match 'Downloading|Extracting'
@@ -168,11 +238,75 @@ function Invoke-DockerLive {
                     }
                 }
             }
-        $code = $LASTEXITCODE
+            $line = ''
+            while ($stderrQueue.TryDequeue([ref]$line)) {
+                $line = [regex]::Replace([string]$line, $ansiPattern, '') -replace "`r", ''
+                [void]$lines.Add($line)
+                $emitted = $true
+                if (-not [string]::IsNullOrWhiteSpace($line)) {
+                    $now = [int]$RunClock.Elapsed.TotalMilliseconds
+                    $isTransferProgress = $line -match 'Downloading|Extracting'
+                    if (-not $isTransferProgress -or (($now - $lastPrintedAt) -ge 500 -and $line -ne $lastPrintedLine)) {
+                        Write-RunProgress "$Stage | $line"
+                        $lastPrintedLine = $line
+                        $lastPrintedAt = $now
+                    }
+                }
+            }
+            if (-not $emitted -and ([int]$RunClock.Elapsed.TotalMilliseconds - $lastHeartbeatAt) -ge 1000) {
+                $lastHeartbeatAt = [int]$RunClock.Elapsed.TotalMilliseconds
+                Write-RunProgress "$Stage waiting elapsed_ms=$lastHeartbeatAt"
+            }
+            if ($started.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                Write-RunProgress "$Stage deadline exceeded elapsed_ms=$([int]$RunClock.Elapsed.TotalMilliseconds)"
+                try { $process.Kill() } catch { }
+                $code = 124
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        if ($code -ne 124) {
+            $process.WaitForExit()
+            Start-Sleep -Milliseconds 100
+            $line = ''
+            while ($stdoutQueue.TryDequeue([ref]$line)) {
+                $line = [regex]::Replace([string]$line, $ansiPattern, '') -replace "`r", ''
+                [void]$lines.Add($line)
+                if (-not [string]::IsNullOrWhiteSpace($line)) { Write-RunProgress "$Stage | $line" }
+            }
+            $line = ''
+            while ($stderrQueue.TryDequeue([ref]$line)) {
+                $line = [regex]::Replace([string]$line, $ansiPattern, '') -replace "`r", ''
+                [void]$lines.Add($line)
+                if (-not [string]::IsNullOrWhiteSpace($line)) { Write-RunProgress "$Stage | $line" }
+            }
+            $code = $process.ExitCode
+        } else {
+            try { $process.WaitForExit(5000) } catch { }
+        }
+    } catch {
+        [void]$lines.Add($_.Exception.Message)
+        Write-RunProgress "$Stage error=$($_.Exception.Message)"
     } finally {
-        $ErrorActionPreference = $previousErrorAction
-        if ($null -eq $previousDockerTimeout) { Remove-Item Env:DOCKER_CLIENT_TIMEOUT -ErrorAction SilentlyContinue } else { $env:DOCKER_CLIENT_TIMEOUT = $previousDockerTimeout }
-        if ($null -eq $previousComposeTimeout) { Remove-Item Env:COMPOSE_HTTP_TIMEOUT -ErrorAction SilentlyContinue } else { $env:COMPOSE_HTTP_TIMEOUT = $previousComposeTimeout }
+        foreach ($subscription in @($stdoutSubscription, $stderrSubscription)) {
+            if ($null -ne $subscription) {
+                # Windows PowerShell 5.1 returns a PSEventJob whose
+                # SourceIdentifier property is empty; the registered source
+                # is held in Name.  Prefer the former when available, then
+                # fall back to the latter so repeated Docker invocations do
+                # not leak event subscribers/jobs into the caller's session.
+                $eventSource = [string]$subscription.SourceIdentifier
+                if ([string]::IsNullOrWhiteSpace($eventSource)) { $eventSource = [string]$subscription.Name }
+                if (-not [string]::IsNullOrWhiteSpace($eventSource)) {
+                    try { Unregister-Event -SourceIdentifier $eventSource -ErrorAction SilentlyContinue } catch { }
+                    try { Get-Job -Name $eventSource -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue } catch { }
+                }
+            }
+        }
+        try {
+            if ($lines.Count -gt 0) { Write-AtomicText $capturePath ($lines -join "`n") }
+        } catch { }
+        if ($null -ne $process) { $process.Dispose() }
     }
     Write-RunProgress "$Stage finished exit=$code"
     [pscustomobject]@{ Output = ($lines -join "`n"); ExitCode = $code }
@@ -213,7 +347,13 @@ function Test-DockerEngine {
     }
     if ($result.ExitCode -ne 0) {
         Write-RunProgress 'Docker daemon probe finished ready=false'
-        return [pscustomobject]@{ Ready = $false; Code = $Exit.Engine; Reason = 'Docker daemon is unavailable.'; Raw = $result.Output }
+        $detail = ([string]$result.Output).Trim()
+        $reason = if ($detail -match 'pipe/docker_engine|daemon is not running|cannot connect') {
+            'Docker CLI is installed but the Docker daemon is not running. The project does not start Docker Desktop or switch contexts automatically.'
+        } else {
+            'Docker daemon is unavailable.'
+        }
+        return [pscustomobject]@{ Ready = $false; Code = $Exit.Engine; Reason = $reason; Raw = $detail }
     }
     try { $info = $result.Output | ConvertFrom-Json } catch {
         Write-RunProgress 'Docker daemon probe finished ready=false invalid-info'
@@ -238,22 +378,33 @@ function Test-Backend {
     if ($context -notmatch 'desktop-linux|default') { return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = "Unexpected local Docker context: $context"; Context = $context } }
     $proof = $false
     $proofSource = 'environment'
+    $backendSettingKnown = $false
+    $wslBackendDetected = $false
     $settings = @(
         (Join-Path $env:APPDATA 'Docker\settings-store.json'),
-        (Join-Path $env:LOCALAPPDATA 'Docker\settings-store.json')
+        (Join-Path $env:LOCALAPPDATA 'Docker\settings-store.json'),
+        (Join-Path $env:PROGRAMDATA 'DockerDesktop\install-settings.json')
     )
     foreach ($settingsPath in $settings) {
-        if (-not $proof -and (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
+        if (Test-Path -LiteralPath $settingsPath -PathType Leaf) {
             try {
                 $dockerSettings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
-                if ($dockerSettings.PSObject.Properties.Name -contains 'WslEngineEnabled' -and -not [bool]$dockerSettings.WslEngineEnabled) {
-                    $proof = $true
-                    $proofSource = $settingsPath
+                $wslProperty = @($dockerSettings.PSObject.Properties | Where-Object { $_.Name -ieq 'WslEngineEnabled' }) | Select-Object -First 1
+                if ($null -ne $wslProperty) {
+                    $backendSettingKnown = $true
+                    if ([bool]$wslProperty.Value) { $wslBackendDetected = $true }
+                    else {
+                        $proof = $true
+                        $proofSource = $settingsPath
+                    }
                 }
             } catch { }
         }
     }
-    if (-not $proof -and $env:LOCALAI_HYPERV_VERIFIED -eq '1') { $proof = $true }
+    if ($wslBackendDetected) {
+        return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = 'Docker Desktop is configured with its WSL2 backend. This project will not use or switch that backend; select a verified Hyper-V backend or an explicit native Linux Docker context.'; Context = $context }
+    }
+    if (-not $proof -and -not $backendSettingKnown -and $env:LOCALAI_HYPERV_VERIFIED -eq '1') { $proof = $true }
     if (-not $proof) {
         return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = 'A non-WSL Docker Desktop backend is not proven. Select Hyper-V and set LOCALAI_HYPERV_VERIFIED=1, or provide a Docker Desktop settings record with WslEngineEnabled=false.'; Context = $context }
     }
@@ -514,7 +665,8 @@ function Invoke-ApiLive {
         [string]$Body,
         [switch]$Authenticated,
         [string]$Label = 'API request',
-        [int]$TimeoutSeconds = 180
+        [int]$TimeoutSeconds = 180,
+        [switch]$ExtraUsage
     )
     $headers = @{}
     if ($Authenticated) { $headers.Authorization = 'Bearer ' + (Get-ApiKey) }
@@ -523,9 +675,10 @@ function Invoke-ApiLive {
     $started = [Diagnostics.Stopwatch]::StartNew()
     try {
         $job = Start-Job -ScriptBlock {
-            param([string]$RequestUri, [string]$RequestBody, [string]$ApiKey)
+            param([string]$RequestUri, [string]$RequestBody, [string]$ApiKey, [bool]$IncludeExtraUsage)
             $requestHeaders = @{}
             if ($ApiKey) { $requestHeaders.Authorization = 'Bearer ' + $ApiKey }
+            if ($IncludeExtraUsage) { $requestHeaders['Extra-Usage'] = 'true' }
             try {
                 if ($RequestBody) {
                     Invoke-RestMethod -Uri $RequestUri -Method Post -Headers $requestHeaders -ContentType 'application/json' -Body $RequestBody -TimeoutSec 330
@@ -533,7 +686,7 @@ function Invoke-ApiLive {
                     Invoke-RestMethod -Uri $RequestUri -Method Get -Headers $requestHeaders -TimeoutSec 15
                 }
             } catch { }
-        } -ArgumentList $uri, $Body, $(if ($Authenticated) { Get-ApiKey } else { '' })
+        } -ArgumentList $uri, $Body, $(if ($Authenticated) { Get-ApiKey } else { '' }), [bool]$ExtraUsage
         while ($job.State -eq 'Running' -and $started.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
             Start-Sleep -Milliseconds 500
             if ($started.ElapsedMilliseconds -ge 1000) {
@@ -633,10 +786,22 @@ function Test-Ready {
     $receipt = Get-Receipt
     if (-not $receipt) { return [pscustomobject]@{ Ready = $false; Code = $Exit.NotReady; Reason = 'No verified deployment receipt exists.'; Backend = $name } }
     if ([string]$receipt.backend -ne $name) { return [pscustomobject]@{ Ready = $false; Code = $Exit.Provenance; Reason = 'Deployment backend does not match the selected backend.'; Backend = $name } }
+    $receiptProfile = if ($receipt.PSObject.Properties.Name -contains 'profile') { [string]$receipt.profile } else { '' }
+    if ($receiptProfile -ne $Profile) { return [pscustomobject]@{ Ready = $false; Code = $Exit.NotReady; Reason = "Profile '$receiptProfile' is deployed; requested profile '$Profile' is not active."; Backend = $name; Receipt = $receipt } }
+    $receiptAcceptance = if ($receipt.PSObject.Properties.Name -contains 'acceptance') { [string]$receipt.acceptance } else { '' }
+    $hasBenchmark = $receipt.PSObject.Properties.Name -contains 'benchmark' -and $null -ne $receipt.benchmark
+    if ($receiptAcceptance -ne 'core-inference-and-profile-benchmark-passed' -or -not $hasBenchmark) {
+        return [pscustomobject]@{ Ready = $false; Code = $Exit.Provenance; Reason = 'Deployment receipt predates the current verified inference-and-profile benchmark contract. Run the normal launcher to rebuild it.'; Backend = $name; Receipt = $receipt }
+    }
     try {
+        $runtimeLock = Read-JsonFile (Join-Path $ConfigRoot 'runtime.lock.json')
+        $expectedImageDigest = if ($name -eq 'native-linux-gpu') { [string]$runtimeLock.images.localai_gpu.digest } else { [string]$runtimeLock.images.localai_cpu.digest }
+        if ([string]$receipt.image_digest -ne $expectedImageDigest) { throw 'Deployment LocalAI image digest does not match the current runtime lock.' }
         $modelLock = Read-JsonFile (Join-Path $ConfigRoot 'models.lock.json')
         $model = @($modelLock.models | Where-Object id -eq $receipt.model_id | Select-Object -First 1)
         if ($model.Count -ne 1) { throw 'Receipt model is absent from the model lock.' }
+        if (@($model[0].profiles | ForEach-Object { [string]$_ }) -notcontains $Profile) { throw "Receipt model is not verified for profile '$Profile'." }
+        if ([string]$receipt.model_revision -ne [string]$model[0].revision) { throw 'Deployment model revision does not match the current model lock.' }
         $artifact = @($model[0].artifacts | Where-Object role -eq 'main' | Select-Object -First 1)
         $artifactPath = Join-Path $DataRoot ("models\$($receipt.model_id)\$($artifact[0].filename)")
         if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) { throw 'Verified model artifact is missing.' }
@@ -743,6 +908,12 @@ function Install-Core {
         return $Exit.Server
     }
     Write-RunProgress 'authenticated agent smoke task finished visible_answer=verified'
+    $benchmark = Invoke-ProfileBenchmark $modelId $Profile
+    if (-not $benchmark.Passed) {
+        [Console]::Error.WriteLine("Profile benchmark failed: $($benchmark.Reason)")
+        return $Exit.Server
+    }
+    Write-RunProgress "profile benchmark finished profile=$Profile end_to_end_tokens_per_second=$($benchmark.end_to_end_completion_tokens_per_second) floor=$($benchmark.minimum_end_to_end_completion_tokens_per_second)"
     $modelLock = Read-JsonFile (Join-Path $ConfigRoot 'models.lock.json')
     $modelEntry = @($modelLock.models | Where-Object id -eq $modelId | Select-Object -First 1)
     if ($modelEntry.Count -ne 1) { [Console]::Error.WriteLine('The selected model is absent from the model lock.'); return $Exit.Provenance }
@@ -765,7 +936,7 @@ function Install-Core {
         image_ids = $images.Images
         docker_context = [string]$backend.Context; engine_os_type = [string]$backend.Engine.OSType; backend_proof = $backendProof
         model_revision = [string]$modelEntry[0].revision; model_artifact_sha256 = $artifactHash; model_artifact_size_bytes = [int64]$artifact[0].size_bytes
-        packs = $packs; created_at = (Get-Date).ToUniversalTime().ToString('o'); acceptance = 'core-inference-passed'
+        packs = $packs; benchmark = $benchmark; created_at = (Get-Date).ToUniversalTime().ToString('o'); acceptance = 'core-inference-and-profile-benchmark-passed'
     }
     $receiptPath = Join-Path $DataRoot ('deployments\' + $deployment.deployment_id + '.json')
     $jsonText = $deployment | ConvertTo-Json -Depth 12
@@ -867,6 +1038,48 @@ function Install-Packs {
 function Get-AssistantText {
     param([Parameter(Mandatory = $true)]$Response)
     try { return [string]$Response.choices[0].message.content } catch { return '' }
+}
+
+function Invoke-ProfileBenchmark {
+    param([Parameter(Mandatory = $true)][string]$ModelId, [Parameter(Mandatory = $true)][string]$ProfileName)
+    $profiles = Read-JsonFile (Join-Path $ConfigRoot 'profiles.json')
+    $profile = $profiles.profiles.$ProfileName
+    if ($null -eq $profile) { return [pscustomobject]@{ Passed = $false; Reason = "Profile is not defined: $ProfileName" } }
+    $marker = 'LOCALAI_PROFILE_BENCHMARK_OK'
+    $body = @{ model = $ModelId; messages = @(@{ role = 'user'; content = "Reply with exactly $marker and nothing else." }); max_tokens = 16; stream = $false } | ConvertTo-Json -Depth 8
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $response = Invoke-ApiLive '/v1/chat/completions' $body -Authenticated -Label "$ProfileName profile benchmark" -TimeoutSeconds 180 -ExtraUsage
+    $clock.Stop()
+    if ($null -eq $response) { return [pscustomobject]@{ Passed = $false; Reason = 'Benchmark inference failed.' } }
+    $visible = ''
+    try { $visible = [string]$response.choices[0].message.content } catch { }
+    if ($visible -notmatch [regex]::Escape($marker)) { return [pscustomobject]@{ Passed = $false; Reason = 'Benchmark returned no verified visible marker.' } }
+    $tokens = 0
+    try { $tokens = [int]$response.usage.completion_tokens } catch { }
+    if ($tokens -le 0) { return [pscustomobject]@{ Passed = $false; Reason = 'Model response did not report completion_tokens.'; elapsed_ms = $clock.ElapsedMilliseconds } }
+    $seconds = [Math]::Max(0.001, $clock.Elapsed.TotalSeconds)
+    # This is the end-to-end completion rate: it includes queueing, prompt
+    # processing, generation, transport, and response parsing.  It is the
+    # same metric LocalAI's benchmark command documents, and must not be
+    # mislabeled as decode-only llama.cpp speed.
+    $endToEndTokensPerSecond = [Math]::Round($tokens / $seconds, 3)
+    $minimum = [double]$profile.minimum_generation_tps
+    $timingGenerationMs = $null
+    $decodeOnlyTokensPerSecond = $null
+    try {
+        $timingGenerationMs = [double]$response.usage.timing_token_generation
+        if ($timingGenerationMs -gt 0) { $decodeOnlyTokensPerSecond = [Math]::Round($tokens / ($timingGenerationMs / 1000.0), 3) }
+    } catch { }
+    [pscustomobject]@{
+        Passed = ($endToEndTokensPerSecond -ge $minimum)
+        Reason = if ($endToEndTokensPerSecond -ge $minimum) { 'Measured end-to-end profile floor passed.' } else { "Measured end-to-end completion rate is below the profile floor ($minimum tokens/second)." }
+        model_id = $ModelId; profile = $ProfileName; completion_tokens = $tokens
+        elapsed_ms = $clock.ElapsedMilliseconds; metric = 'end_to_end_completion_tokens_per_second'
+        end_to_end_completion_tokens_per_second = $endToEndTokensPerSecond
+        minimum_end_to_end_completion_tokens_per_second = $minimum
+        timing_token_generation_ms = $timingGenerationMs
+        decode_only_completion_tokens_per_second = $decodeOnlyTokensPerSecond
+    }
 }
 
 function Start-Interactive {

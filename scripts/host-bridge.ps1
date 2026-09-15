@@ -217,20 +217,25 @@ function Get-FolderListing {
     $queue.Enqueue($item.FullName)
     while ($queue.Count -gt 0 -and $folderCount -lt $maxItems -and (Get-Date) -lt $deadline) {
         $directory = $queue.Dequeue()
-        try { $children = [IO.Directory]::EnumerateDirectories($directory, '*', [IO.SearchOption]::TopDirectoryOnly) }
-        catch { [void]$errors.Add(('{0}: {1}' -f $directory, $_.Exception.Message)); continue }
-        foreach ($childPath in $children) {
-            if ((Get-Date) -ge $deadline) { $timedOut = $true; break }
-            try { $attributes = [IO.File]::GetAttributes($childPath) } catch { [void]$errors.Add(('{0}: {1}' -f $childPath, $_.Exception.Message)); continue }
-            if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
-            $childName = [IO.Path]::GetFileName($childPath.TrimEnd('\'))
-            $entry = [ordered]@{ path = $childPath; name = $childName; parent = $directory }
-            $folderCount++
-            if ($folders.Count -lt $displayLimit) { [void]$folders.Add($entry) }
-            if ($null -ne $evidenceWriter) { $evidenceWriter.WriteLine($childPath) }
-            if ($recursive -and $folderCount -lt $maxItems) { $queue.Enqueue($childPath) }
-            if ($folderCount -ge $maxItems) { break }
-        }
+        try {
+            # EnumerateDirectories is lazy: access-denied and I/O failures
+            # can be raised by foreach rather than by the call that creates
+            # the enumerable.  Keep the scan alive and record that the result
+            # is partial instead of turning a large-drive scan into a 400.
+            $children = [IO.Directory]::EnumerateDirectories($directory, '*', [IO.SearchOption]::TopDirectoryOnly)
+            foreach ($childPath in $children) {
+                if ((Get-Date) -ge $deadline) { $timedOut = $true; break }
+                try { $attributes = [IO.File]::GetAttributes($childPath) } catch { [void]$errors.Add(('{0}: {1}' -f $childPath, $_.Exception.Message)); continue }
+                if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                $childName = [IO.Path]::GetFileName($childPath.TrimEnd('\'))
+                $entry = [ordered]@{ path = $childPath; name = $childName; parent = $directory }
+                $folderCount++
+                if ($folders.Count -lt $displayLimit) { [void]$folders.Add($entry) }
+                if ($null -ne $evidenceWriter) { $evidenceWriter.WriteLine($childPath) }
+                if ($recursive -and $folderCount -lt $maxItems) { $queue.Enqueue($childPath) }
+                if ($folderCount -ge $maxItems) { break }
+            }
+        } catch { [void]$errors.Add(('{0}: {1}' -f $directory, $_.Exception.Message)) }
         if (-not $recursive) { break }
     }
     if ($null -ne $evidenceWriter) {
@@ -251,7 +256,7 @@ function Get-FolderListing {
         recursive = $recursive
         folders = $folders.ToArray()
         count = $folderCount
-        truncated = ($timedOut -or $queue.Count -gt 0 -or $folderCount -ge $maxItems)
+        truncated = ($timedOut -or $queue.Count -gt 0 -or $folderCount -ge $maxItems -or $errors.Count -gt 0)
         display_truncated = ($folderCount -gt $displayLimit)
         evidence_path = $evidencePath
         deadline_seconds = $maxSeconds

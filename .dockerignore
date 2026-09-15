@@ -3,6 +3,10 @@
 .env.*
 secrets/*
 data/models/*
+data/backends/*
+data/configuration/*
+data/workspace/*
+data/localai/*
 data/cache/*
 data/deployments/*
 state/*
@@ -11,4 +15,3 @@ evidence/*
 backups/*
 __pycache__/
 *.pyc
-

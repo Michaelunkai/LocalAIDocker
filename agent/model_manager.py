@@ -109,6 +109,21 @@ def write_atomic_text(target: pathlib.Path, text: str) -> None:
             os.unlink(temp_name)
 
 
+def safe_child_directory(root: pathlib.Path, model_id: str) -> pathlib.Path:
+    """Return a model directory that cannot escape the mounted model root."""
+    if root.exists() and root.is_symlink():
+        raise RuntimeError("model output root must not be a symbolic link")
+    root = root.resolve()
+    candidate = root / model_id
+    if candidate.exists() and candidate.is_symlink():
+        raise RuntimeError(f"model directory is a symbolic link: {candidate}")
+    try:
+        candidate.resolve().relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(f"model directory escapes the output root: {model_id}") from exc
+    return candidate
+
+
 def selected_models(lock: dict) -> list[dict]:
     requested_id = os.environ.get("MODEL_ID", "").strip()
     if requested_id:
@@ -179,10 +194,12 @@ def main() -> None:
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
     validate_lock(lock)
     for model in selected_models(lock):
-        model_dir = output / model["id"]
+        model_dir = safe_child_directory(output, str(model["id"]))
         model_dir.mkdir(parents=True, exist_ok=True)
         for artifact in model.get("artifacts", []):
             target = model_dir / artifact["filename"]
+            if target.exists() and target.is_symlink():
+                raise RuntimeError(f"model artifact is a symbolic link: {target}")
             if target.exists() and target.stat().st_size == artifact["size_bytes"]:
                 digest = sha256_file(target)
                 if digest == artifact["sha256"]:
@@ -194,6 +211,8 @@ def main() -> None:
             download(artifact["url"], target, artifact["size_bytes"], artifact["sha256"])
         main_artifact = next(item for item in model["artifacts"] if item["role"] == "main")
         final_config = output / f"{model['id']}.yaml"
+        if final_config.exists() and final_config.is_symlink():
+            raise RuntimeError(f"model configuration is a symbolic link: {final_config}")
         pending_config = output / f".{model['id']}.yaml.pending"
         write_atomic_text(pending_config, model_config(model, main_artifact))
         # Artifacts remain durable for rollback, but only the selected locked
