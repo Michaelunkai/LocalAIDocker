@@ -176,7 +176,9 @@ function Test-AcceptanceBackendPolicy {
         'C:\ProgramData\DockerDesktop\install-settings.json'
     )
     $settingFound = $false
-    $wslEngineEnabled = $null
+    $wslEngineEnabled = $false
+    $wslEngineExplicitlyEnabled = $false
+    $wslEngineExplicitlyDisabled = $false
     foreach ($settingsPath in $settingsPaths) {
         if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) { continue }
         try {
@@ -184,15 +186,15 @@ function Test-AcceptanceBackendPolicy {
             $property = @($settings.PSObject.Properties | Where-Object { $_.Name -ieq 'WslEngineEnabled' }) | Select-Object -First 1
             if ($null -ne $property) {
                 $settingFound = $true
-                $wslEngineEnabled = [bool]$property.Value
-                break
+                if ([bool]$property.Value) { $wslEngineExplicitlyEnabled = $true }
+                else { $wslEngineExplicitlyDisabled = $true }
             }
         } catch { }
     }
-    if ($settingFound -and $wslEngineEnabled) {
+    if ($wslEngineExplicitlyEnabled) {
         return [pscustomobject]@{ Ready = $false; Context = $context; Reason = 'Docker Desktop is configured with its WSL2 backend; runtime acceptance is not valid for this no-WSL2 project.' }
     }
-    if ($settingFound -and -not $wslEngineEnabled) {
+    if ($settingFound -and $wslEngineExplicitlyDisabled) {
         return [pscustomobject]@{ Ready = $true; Context = $context; Reason = 'Docker Desktop non-WSL backend is explicitly recorded.' }
     }
     if ($env:LOCALAI_HYPERV_VERIFIED -eq '1') {
