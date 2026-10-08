@@ -1,8 +1,27 @@
 services:
   media-tools:
-    image: ${MEDIA_IMAGE:?Media pack image must be explicitly locked}
-    profiles: ["media"]
-    command: ["sleep", "infinity"]
+    image: ${MEDIA_IMAGE:-localaidocker/media-tools:locked}
+    command: ["python", "/app/tool_runner.py"]
+    environment:
+      TOOL_RUNNER_BIND: 0.0.0.0:8782
+      TOOL_PACK: media
+      WORKSPACE_ROOT: /workspace
+    expose: ["8782"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8782/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 3s
     volumes:
       - ./data/workspace:/workspace
     networks: [inference]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=256m"]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+  agent:
+    depends_on:
+      media-tools:
+        condition: service_healthy

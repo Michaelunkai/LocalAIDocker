@@ -9,9 +9,9 @@ smoke-tested, and recorded in `state\current-deployment.json`.
 | --- | --- | --- |
 | core | LocalAI, gateway, and agent; host bridge optional | Text inference, bounded agent tasks, target-local workspace writes, and structured commands. Windows inspection, project writes through the bridge, and explicit Chrome URL launch receipts appear only when the authenticated bridge is healthy. |
 | gpu | Native Linux Docker context only | Requires a verified NVIDIA Container Toolkit path; never claimed on Hyper-V CPU |
-| coding | Agent image | Git, ripgrep, C/C++ build tools, Node, Go, Rust, and Java smoke-tested when installed |
-| media | Agent image | ffmpeg and ImageMagick smoke-tested when installed |
-| documents | Agent image | Pandoc, Poppler, Ghostscript, and Tesseract smoke-tested when installed |
+| coding | Dedicated unprivileged tool-runner container | Git, ripgrep, C/C++ build tools, Node, Go, Rust, and Java smoke-tested when installed |
+| media | Dedicated unprivileged tool-runner container | ffmpeg and ImageMagick smoke-tested when installed |
+| documents | Dedicated unprivileged tool-runner container | Pandoc, Poppler, Ghostscript, and Tesseract smoke-tested when installed |
 | browser | Isolated Chromium container | Public URL opening and DOM observation only; no host browser profile or cookies; separate from core's requested host-Chrome launch |
 | research | Agent public-read network | Bounded public fetch with URL validation and provenance |
 | containers | Not enabled by default | Requires a separately verified rootless nested engine; no host Docker socket |

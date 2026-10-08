@@ -19,12 +19,12 @@ The Docker daemon must already be running. The launcher never starts Docker Desk
 ## Run the complete application
 
 The no-argument command is the normal full-run path. Every invocation performs a
-fresh project-owned cycle with timestamped output: it validates Docker, refreshes
-the locked LocalAI image, builds the project images, verifies or downloads the
-locked model data, recreates new application containers, waits for health, and
-runs an authenticated visible-answer smoke test before reporting ready. Docker
-build caching may make later image builds faster; `--force-recreate` still makes
-new containers on every normal run.
+fresh project-owned cycle with timestamped output: it validates Docker, verifies
+or pulls the locked LocalAI image when absent, builds the project images,
+verifies or downloads the locked model data, recreates new application
+containers, waits for health, and runs an authenticated visible-answer smoke
+test before reporting ready. Docker build caching may make later image builds
+faster; `--force-recreate` still makes new containers on every normal run.
 
 ```powershell
 & 'F:\study\AI\_ML\LocalAI\LocalAIDocker\scripts\llm.ps1'
@@ -80,17 +80,21 @@ Capability packs that are locally verifiable can be installed explicitly:
 & .\scripts\llm.ps1 -Install -Pack browser
 ```
 
-Coding, media, and document packs rebuild the agent image with their tool
-families and run executable smoke probes. The research pack enables bounded
+Coding, media, and document packs build separate, unprivileged argv-runner
+images with their tool families and run executable smoke probes; the core
+agent image remains minimal. The research pack enables bounded
 public fetching with DNS/private-address and redirect checks. The browser pack
 builds an isolated Chromium service with no host browser profile or cookies;
 its smoke test must observe a public page before the pack is marked ready.
 Containers and harness remain unavailable until their isolated services have
 their own image digests and acceptance proofs.
 
-The gateway is available only on `http://127.0.0.1:8080`. The API key is
-generated under `secrets\localai-api-key` during the first full deployment (or
-an explicit `-Install`) and is never printed by the launcher.
+The gateway is loopback-only. It prefers `http://127.0.0.1:8080` and selects a
+free persisted loopback port when that port is occupied; the exact endpoint is
+printed in `LOCALAI_INTERACTIVE_READY` and stored in
+`state\current-deployment.json`. The API key is generated under
+`secrets\localai-api-key` during the first full deployment (or an explicit
+`-Install`) and is never printed by the launcher.
 
 After a successful no-argument run, the launcher stays open in interactive
 mode instead of returning to PowerShell. Use `/help`, `/status`, or `/exit` at
@@ -100,9 +104,9 @@ keeps one-shot behavior.
 Interactive requests are routed through the authenticated agent service, not
 directly to the language model. The core agent can always prove its deployment
 model and read/write its target-local workspace atomically. When the optional
-target-local host bridge is healthy, it can also list directories on the
-configured Windows read-only drive, read bounded Windows files, list a bounded
-Windows process snapshot, and launch an explicit Chrome URL. If that bridge is
+target-local host bridge is healthy, it can also list directories inside the
+LocalAIDocker project root, read bounded Windows files from that same root, list
+a bounded Windows process snapshot, and launch an explicit Chrome URL. If that bridge is
 unavailable, core inference still enters interactive mode and those host
 capabilities are reported as unavailable. Large recursive scans write the complete
 discovered path stream under `evidence\` and report whether enumeration or

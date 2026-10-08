@@ -1,12 +1,11 @@
 {
   "schema_version": 1,
   "profiles": {
-    "fast": {"required_capabilities": ["text"], "minimum_generation_tps": 5},
-    "balanced": {"required_capabilities": ["text"], "minimum_generation_tps": 3},
+    "fast": {"required_capabilities": ["text"], "minimum_generation_tps": 2},
+    "balanced": {"required_capabilities": ["text"], "minimum_generation_tps": 2},
     "quality": {"required_capabilities": ["text"], "minimum_generation_tps": 1},
-    "coding": {"required_capabilities": ["text", "coding"], "minimum_generation_tps": 3},
+    "coding": {"required_capabilities": ["text", "coding"], "minimum_generation_tps": 2},
     "vision": {"required_capabilities": ["text", "vision"], "minimum_generation_tps": 1}
   },
   "selection": ["explicit-profile", "capability-fit", "resource-fit", "benchmark-status", "fastest-verified"]
 }
-

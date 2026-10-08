@@ -1,8 +1,27 @@
 services:
   document-tools:
-    image: ${DOCUMENTS_IMAGE:?Documents pack image must be explicitly locked}
-    profiles: ["documents"]
-    command: ["sleep", "infinity"]
+    image: ${DOCUMENTS_IMAGE:-localaidocker/documents-tools:locked}
+    command: ["python", "/app/tool_runner.py"]
+    environment:
+      TOOL_RUNNER_BIND: 0.0.0.0:8783
+      TOOL_PACK: documents
+      WORKSPACE_ROOT: /workspace
+    expose: ["8783"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8783/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 3s
     volumes:
       - ./data/workspace:/workspace
     networks: [inference]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=256m"]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+  agent:
+    depends_on:
+      document-tools:
+        condition: service_healthy

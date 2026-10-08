@@ -55,7 +55,6 @@ services:
       dockerfile: docker/agent/Dockerfile
       args:
         BASE_IMAGE: ${AGENT_BASE_IMAGE:?Run scripts/llm.ps1 -Install first}
-        INSTALL_PACKS: ${INSTALL_PACKS:-}
     command: ["python", "-m", "agent.gateway"]
     environment:
       LOCALAI_URL: http://localai:8080
@@ -64,6 +63,7 @@ services:
       HOST_BRIDGE_KEY_FILE: /run/secrets/host_bridge_key
       HOST_BRIDGE_URL: http://host.docker.internal:8765
       GATEWAY_BIND: 0.0.0.0:8080
+      LOG_FILE: /app/logs/gateway.jsonl
     secrets:
       - localai_api_key
       - host_bridge_key
@@ -71,11 +71,20 @@ services:
       localai:
         condition: service_healthy
     ports:
-      - "127.0.0.1:8080:8080"
+      # 8080 is the preferred port, but the launcher selects and records a
+      # free loopback port when another local service already owns it.
+      - "127.0.0.1:${LOCALAI_GATEWAY_HOST_PORT:-8080}:8080"
     networks:
       - inference
+      # Docker Desktop's internal bridge networks intentionally do not
+      # publish container ports to Windows.  The gateway therefore uses the
+      # dedicated frontend bridge for the loopback-only published endpoint;
+      # its application routes remain limited to LocalAI, the agent, and the
+      # explicitly configured host bridge.
       - frontend
     read_only: true
+    volumes:
+      - ./logs:/app/logs
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
     security_opt:
@@ -91,7 +100,6 @@ services:
       dockerfile: docker/agent/Dockerfile
       args:
         BASE_IMAGE: ${AGENT_BASE_IMAGE:?Run scripts/llm.ps1 -Install first}
-        INSTALL_PACKS: ${INSTALL_PACKS:-}
     command: ["python", "-m", "agent.nature_agent"]
     environment:
       LOCALAI_URL: http://localai:8080
@@ -101,8 +109,12 @@ services:
       TASK_STATE_ROOT: /app/task-state
       HOST_BRIDGE_URL: http://gateway:8080/host-bridge
       HOST_BRIDGE_KEY_FILE: /run/secrets/host_bridge_key
+      CODING_RUNNER_URL: http://coding-tools:8781
+      MEDIA_RUNNER_URL: http://media-tools:8782
+      DOCUMENTS_RUNNER_URL: http://document-tools:8783
       AGENT_PACKS: ${AGENT_PACKS:-core}
       HOST_BRIDGE_AVAILABLE: ${HOST_BRIDGE_AVAILABLE:-0}
+      LOG_FILE: /app/logs/agent.jsonl
     secrets:
       - host_bridge_key
     depends_on:
@@ -158,10 +170,10 @@ networks:
   download:
     internal: false
   frontend:
-    # Host port publishing still works on an internal Docker network; keeping
-    # this network internal prevents the gateway from gaining unrelated
-    # outbound network access in the core deployment.
-    internal: true
+    # This network must be externally publishable for Docker Desktop's
+    # Windows loopback port-forwarder.  Only the gateway is attached to it;
+    # LocalAI and the agent remain isolated on the internal inference network.
+    internal: false
 
 secrets:
   localai_api_key:

@@ -66,6 +66,14 @@ def _open_page(url: str) -> dict[str, Any]:
             "--headless=new",
             "--disable-gpu",
             "--disable-dev-shm-usage",
+            # The browser runs as an unprivileged user inside a capability-
+            # isolated container with all Linux capabilities dropped and no
+            # host mounts.  Debian's user-namespace sandbox is unavailable in
+            # this Docker Desktop container, so Chromium's own sandbox would
+            # otherwise refuse to start.  Keep the container boundary as the
+            # isolation boundary and make the choice explicit in the receipt.
+            "--no-sandbox",
+            "--disable-crash-reporter",
             "--no-first-run",
             "--no-default-browser-check",
             "--user-data-dir=" + profile,

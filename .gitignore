@@ -36,3 +36,13 @@ secrets/*
 *.sqlite*
 __pycache__/
 *.py[cod]
+
+# Local runtime data - never publish
+secrets/*
+!secrets/.gitkeep
+data/
+logs/
+evidence/
+__pycache__/
+*.pyc
+.venv/

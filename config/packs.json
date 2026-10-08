@@ -3,9 +3,9 @@
   "packs": {
     "core": {"services": ["localai", "agent"], "required": true},
     "gpu": {"services": ["localai"], "requires_backend": "native-linux-gpu", "required": false},
-    "coding": {"services": ["agent"], "implementation": "agent-toolchain", "required": false},
-    "media": {"services": ["agent"], "implementation": "agent-toolchain", "required": false},
-    "documents": {"services": ["agent"], "implementation": "agent-toolchain", "required": false},
+    "coding": {"services": ["coding-tools"], "implementation": "isolated-argv-tool-runner", "network": "none", "required": false},
+    "media": {"services": ["media-tools"], "implementation": "isolated-argv-tool-runner", "network": "none", "required": false},
+    "documents": {"services": ["document-tools"], "implementation": "isolated-argv-tool-runner", "network": "none", "required": false},
     "browser": {"services": ["browser"], "implementation": "isolated-chromium-service", "network": "public-read", "required": false},
     "research": {"services": ["agent"], "implementation": "bounded-agent-fetch", "network": "public-read", "required": false},
     "containers": {"services": ["nested-tools"], "required": false},

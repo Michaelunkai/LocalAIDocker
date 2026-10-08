@@ -15,7 +15,9 @@ The core runtime is:
 3. a private LocalAI network;
 4. an authenticated loopback gateway;
 5. a minimal agent image using the Python standard library;
-6. a deployment receipt under `state\` and `data\deployments\`.
+6. optional coding, media, and document tool-runner images kept separate from
+   the core agent image;
+7. a deployment receipt under `state\` and `data\deployments\`.
 
 There is one active model deployment. Model switching requires an explicit operation and a fresh acceptance probe.
 

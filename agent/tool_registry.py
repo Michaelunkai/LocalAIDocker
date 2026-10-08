@@ -144,7 +144,7 @@ REGISTRY: dict[str, ToolSpec] = {
     ),
     "list_windows_directories": ToolSpec(
         "list_windows_directories",
-        "List directories on the explicitly configured Windows read-only drive, including recursive subdirectories when requested.",
+        "List directories inside the explicitly configured LocalAIDocker project root, including recursive subdirectories when requested.",
         "read",
         "user",
         "host-local",
@@ -156,7 +156,7 @@ REGISTRY: dict[str, ToolSpec] = {
     ),
     "read_windows_file": ToolSpec(
         "read_windows_file",
-        "Read a bounded UTF-8 file from the explicitly configured Windows read-only drive.",
+        "Read a bounded UTF-8 file from the explicitly configured LocalAIDocker project root.",
         "read",
         "user",
         "host-local",
@@ -285,6 +285,57 @@ def _bounded_text(data: bytes, limit: int) -> str:
     return data[:limit].decode("utf-8", errors="replace") + f"\n[output truncated at {limit} bytes]"
 
 
+_RUNNER_ENV = {
+    "coding": "CODING_RUNNER_URL",
+    "media": "MEDIA_RUNNER_URL",
+    "documents": "DOCUMENTS_RUNNER_URL",
+}
+_RUNNER_COMMANDS = {
+    "coding": {
+        "git", "rg", "fd", "fdfind", "gcc", "g++", "cc", "c++", "make",
+        "node", "npm", "npx", "go", "rustc", "cargo", "java", "javac",
+        "pytest", "python", "python3", "dotnet", "ruby", "php", "lua",
+    },
+    "media": {"ffmpeg", "ffprobe", "convert", "magick", "identify"},
+    "documents": {"pandoc", "pdftotext", "pdfinfo", "gs", "tesseract"},
+}
+
+
+def _installed_packs() -> set[str]:
+    return {item.strip().lower() for item in os.environ.get("AGENT_PACKS", "core").split(",") if item.strip()}
+
+
+def _runner_pack(argv: list[str]) -> str | None:
+    executable = pathlib.Path(argv[0]).name.lower()
+    installed = _installed_packs()
+    for pack, commands in _RUNNER_COMMANDS.items():
+        if pack in installed and executable in commands:
+            return pack
+    return None
+
+
+def _runner_request(pack: str, route: str, arguments: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
+    variable = _RUNNER_ENV[pack]
+    base = os.environ.get(variable, "").rstrip("/")
+    if not base:
+        raise PolicyError(f"{pack} capability runner is not configured")
+    body = json.dumps(arguments).encode("utf-8")
+    request = urllib.request.Request(base + route, data=body if arguments else None, method="POST" if arguments else "GET")
+    if arguments:
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            result = json.loads(response.read(3 * 1024 * 1024).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(4096).decode("utf-8", errors="replace")
+        raise PolicyError(f"{pack} capability runner rejected the request ({exc.code}): {detail}") from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise PolicyError(f"{pack} capability runner is unavailable: {exc}") from exc
+    if not isinstance(result, dict):
+        raise PolicyError(f"{pack} capability runner returned an invalid response")
+    return result
+
+
 def _read_workspace_file(arguments: dict[str, Any]) -> dict[str, Any]:
     path = scoped_path(str(arguments.get("path", "")))
     if not path.is_file():
@@ -329,6 +380,9 @@ def _run_command(arguments: dict[str, Any]) -> dict[str, Any]:
         raise PolicyError("run_command requires a non-empty argv array")
     if any("\x00" in value for value in argv):
         raise PolicyError("NUL bytes are not allowed in argv")
+    runner_pack = _runner_pack(argv)
+    if runner_pack:
+        return _runner_request(runner_pack, "/v1/run", arguments, timeout= min(900.0, max(1.0, float(arguments.get("timeout_seconds", 120)) + 5.0)))
     cwd = scoped_path(str(arguments.get("cwd", ".")))
     if not cwd.is_dir():
         raise PolicyError("command cwd is not a workspace directory")
@@ -354,7 +408,12 @@ def _run_command(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _bridge_request(route: str, arguments: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
+def _bridge_request(
+    route: str,
+    arguments: dict[str, Any],
+    timeout: float = 30.0,
+    explicit_user_intent: bool = False,
+) -> dict[str, Any]:
     base = os.environ.get("HOST_BRIDGE_URL", "http://gateway:8080/host-bridge").rstrip("/")
     key_path = pathlib.Path(os.environ.get("HOST_BRIDGE_KEY_FILE", "/run/secrets/host_bridge_key"))
     try:
@@ -367,6 +426,8 @@ def _bridge_request(route: str, arguments: dict[str, Any], timeout: float = 30.0
     request = urllib.request.Request(base + route, data=body, method="POST")
     request.add_header("Authorization", "Bearer " + key)
     request.add_header("Content-Type", "application/json")
+    if explicit_user_intent:
+        request.add_header("X-LocalAIDocker-User-Intent", "explicit")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             result = json.loads(response.read(20 * 1024 * 1024).decode("utf-8"))
@@ -496,14 +557,9 @@ def _research_fetch(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def _toolchain_status(pack: str) -> dict[str, Any]:
-    expected = {
-        "coding": ["git", "rg", "gcc", "g++", "node", "npm", "go", "rustc", "cargo", "java"],
-        "media": ["ffmpeg", "convert", "magick"],
-        "documents": ["pandoc", "pdftotext", "gs", "tesseract"],
-    }[pack]
-    present = {name: shutil.which(name) or "" for name in expected}
-    missing = [name for name, path in present.items() if not path]
-    return {"status": "verified" if not missing else "partial", "pack": pack, "present": present, "missing": missing}
+    if pack not in _installed_packs():
+        raise PolicyError(f"{pack} capability pack is not installed")
+    return _runner_request(pack, "/status", {})
 
 
 def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -525,11 +581,11 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if name == "read_windows_file":
         return _bridge_request("/v1/files/read", arguments)
     if name == "write_windows_file":
-        return _bridge_request("/v1/files/write", arguments)
+        return _bridge_request("/v1/files/write", arguments, explicit_user_intent=True)
     if name == "browser_open_url":
         return _browser_request(arguments)
     if name == "open_default_browser":
-        return _bridge_request("/v1/browser/open", arguments, timeout=35.0)
+        return _bridge_request("/v1/browser/open", arguments, timeout=35.0, explicit_user_intent=True)
     if name == "list_processes":
         return _bridge_request("/v1/process/list", arguments)
     if name == "research_fetch":

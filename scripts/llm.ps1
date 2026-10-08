@@ -32,6 +32,7 @@ $BrowserSecretPath = Join-Path $ProjectRoot 'secrets\browser-api-key'
 $HostBridgeScript = Join-Path $ProjectRoot 'scripts\host-bridge.ps1'
 $HostBridgeStatePath = Join-Path $StateRoot 'host-bridge.json'
 $HostBridgePort = 8765
+$DefaultGatewayHostPort = 8080
 $ComposeProject = 'localaidocker'
 $Exit = @{
     Success = 0; Invalid = 2; Engine = 10; NotReady = 11; Install = 12
@@ -101,45 +102,85 @@ function Get-DockerExecutable {
 function Invoke-Docker {
     param([Parameter(Mandatory = $true)][string[]]$Arguments, [int]$TimeoutSeconds = 30)
     $docker = Get-DockerExecutable
-    $previousErrorAction = $ErrorActionPreference
-    $previousDockerTimeout = $env:DOCKER_CLIENT_TIMEOUT
-    $previousComposeTimeout = $env:COMPOSE_HTTP_TIMEOUT
-    $ErrorActionPreference = 'Continue'
-    $env:DOCKER_CLIENT_TIMEOUT = '10'
-    $env:COMPOSE_HTTP_TIMEOUT = '10'
-    $job = $null
+    $process = $null
+    $stdoutSubscription = $null
+    $stderrSubscription = $null
+    $stdoutQueue = New-Object Collections.Concurrent.ConcurrentQueue[string]
+    $stderrQueue = New-Object Collections.Concurrent.ConcurrentQueue[string]
+    $lines = New-Object System.Collections.Generic.List[string]
+    $code = 125
     try {
-        $argumentJson = @($Arguments) | ConvertTo-Json -Compress
-        $job = Start-Job -ScriptBlock {
-            param([string]$Executable, [string]$ArgumentJson)
-            $parsedArguments = ConvertFrom-Json -InputObject $ArgumentJson
-            $Argv = New-Object string[] ([int]$parsedArguments.Count)
-            for ($index = 0; $index -lt $parsedArguments.Count; $index++) {
-                $Argv[$index] = [string]$parsedArguments[$index]
-            }
-            $lines = @(& $Executable @Argv 2>&1)
-            [pscustomobject]@{ Output = ($lines -join "`n"); ExitCode = $LASTEXITCODE }
-        } -ArgumentList $docker, $argumentJson
-        $finished = Wait-Job -Job $job -Timeout ([Math]::Max(1, $TimeoutSeconds))
-        if ($null -eq $finished) {
-            Stop-Job -Job $job -ErrorAction SilentlyContinue | Out-Null
-            return [pscustomobject]@{ Output = "Docker command timed out after $TimeoutSeconds seconds."; ExitCode = 124 }
+        $startInfo = New-Object Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $docker
+        $startInfo.WorkingDirectory = $ProjectRoot
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $argumentListProperty = $startInfo.PSObject.Properties['ArgumentList']
+        if ($null -ne $argumentListProperty) {
+            foreach ($argument in $Arguments) { [void]$startInfo.ArgumentList.Add([string]$argument) }
+        } else {
+            $startInfo.Arguments = (($Arguments | ForEach-Object { ConvertTo-NativeProcessArgument ([string]$_) }) -join ' ')
         }
-        $result = Receive-Job -Job $job | Select-Object -Last 1
-        if ($null -eq $result) { return [pscustomobject]@{ Output = 'Docker command returned no result.'; ExitCode = 125 } }
-        $output = [string]$result.Output
-        $code = [int]$result.ExitCode
+        $startInfo.EnvironmentVariables['DOCKER_CLIENT_TIMEOUT'] = '10'
+        $startInfo.EnvironmentVariables['COMPOSE_HTTP_TIMEOUT'] = '10'
+        $startInfo.EnvironmentVariables['COMPOSE_BAKE'] = 'false'
+        $process = New-Object Diagnostics.Process
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) { throw 'Docker process could not be started.' }
+        $runId = [guid]::NewGuid().ToString('N')
+        $stdoutSource = 'LocalAIDocker.' + $runId + '.stdout'
+        $stderrSource = 'LocalAIDocker.' + $runId + '.stderr'
+        $stdoutSubscription = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -SourceIdentifier $stdoutSource -MessageData $stdoutQueue -Action {
+            if ($null -ne $EventArgs.Data) { [void]$Event.MessageData.Enqueue([string]$EventArgs.Data) }
+        }
+        $stderrSubscription = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -SourceIdentifier $stderrSource -MessageData $stderrQueue -Action {
+            if ($null -ne $EventArgs.Data) { [void]$Event.MessageData.Enqueue([string]$EventArgs.Data) }
+        }
+        $process.BeginOutputReadLine()
+        $process.BeginErrorReadLine()
+        $started = [Diagnostics.Stopwatch]::StartNew()
+        while (-not $process.HasExited) {
+            $line = ''
+            while ($stdoutQueue.TryDequeue([ref]$line)) { [void]$lines.Add([string]$line) }
+            $line = ''
+            while ($stderrQueue.TryDequeue([ref]$line)) { [void]$lines.Add([string]$line) }
+            if ($started.Elapsed.TotalSeconds -ge [Math]::Max(1, $TimeoutSeconds)) {
+                try { $process.Kill() } catch { }
+                $code = 124
+                break
+            }
+            Start-Sleep -Milliseconds 50
+        }
+        if ($code -ne 124) {
+            $process.WaitForExit()
+            Start-Sleep -Milliseconds 100
+            $line = ''
+            while ($stdoutQueue.TryDequeue([ref]$line)) { [void]$lines.Add([string]$line) }
+            $line = ''
+            while ($stderrQueue.TryDequeue([ref]$line)) { [void]$lines.Add([string]$line) }
+            $code = [int]$process.ExitCode
+        }
     }
     catch {
-        return [pscustomobject]@{ Output = $_.Exception.Message; ExitCode = 125 }
+        [void]$lines.Add($_.Exception.Message)
     }
     finally {
-        if ($null -ne $job) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue | Out-Null }
-        $ErrorActionPreference = $previousErrorAction
-        if ($null -eq $previousDockerTimeout) { Remove-Item Env:DOCKER_CLIENT_TIMEOUT -ErrorAction SilentlyContinue } else { $env:DOCKER_CLIENT_TIMEOUT = $previousDockerTimeout }
-        if ($null -eq $previousComposeTimeout) { Remove-Item Env:COMPOSE_HTTP_TIMEOUT -ErrorAction SilentlyContinue } else { $env:COMPOSE_HTTP_TIMEOUT = $previousComposeTimeout }
+        foreach ($subscription in @($stdoutSubscription, $stderrSubscription)) {
+            if ($null -ne $subscription) {
+                $eventSource = ''
+                if ($subscription.PSObject.Properties.Name -contains 'SourceIdentifier') { $eventSource = [string]$subscription.SourceIdentifier }
+                if ([string]::IsNullOrWhiteSpace($eventSource) -and $subscription.PSObject.Properties.Name -contains 'Name') { $eventSource = [string]$subscription.Name }
+                if (-not [string]::IsNullOrWhiteSpace($eventSource)) {
+                    try { Unregister-Event -SourceIdentifier $eventSource -ErrorAction SilentlyContinue } catch { }
+                    try { Get-Job -Name $eventSource -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue } catch { }
+                }
+            }
+        }
+        if ($null -ne $process) { $process.Dispose() }
     }
-    [pscustomobject]@{ Output = ($output -join "`n"); ExitCode = $code }
+    [pscustomobject]@{ Output = ($lines -join "`n"); ExitCode = $code }
 }
 
 function ConvertTo-NativeProcessArgument {
@@ -208,6 +249,12 @@ function Invoke-DockerLive {
         }
         $startInfo.EnvironmentVariables['DOCKER_CLIENT_TIMEOUT'] = '10'
         $startInfo.EnvironmentVariables['COMPOSE_HTTP_TIMEOUT'] = '10'
+        # Docker Desktop may opt Compose into Bake through the user's Docker
+        # CLI configuration.  Bake creates a Windows temp metadata file and
+        # can fail its cleanup with Access Denied on this host.  Keep the
+        # project-local invocation on the regular Compose build path; this
+        # does not modify the user's Docker configuration or switch engines.
+        $startInfo.EnvironmentVariables['COMPOSE_BAKE'] = 'false'
         $process = New-Object Diagnostics.Process
         $process.StartInfo = $startInfo
         if (-not $process.Start()) { throw 'Docker process could not be started.' }
@@ -296,8 +343,9 @@ function Invoke-DockerLive {
                 # is held in Name.  Prefer the former when available, then
                 # fall back to the latter so repeated Docker invocations do
                 # not leak event subscribers/jobs into the caller's session.
-                $eventSource = [string]$subscription.SourceIdentifier
-                if ([string]::IsNullOrWhiteSpace($eventSource)) { $eventSource = [string]$subscription.Name }
+                $eventSource = ''
+                if ($subscription.PSObject.Properties.Name -contains 'SourceIdentifier') { $eventSource = [string]$subscription.SourceIdentifier }
+                if ([string]::IsNullOrWhiteSpace($eventSource) -and $subscription.PSObject.Properties.Name -contains 'Name') { $eventSource = [string]$subscription.Name }
                 if (-not [string]::IsNullOrWhiteSpace($eventSource)) {
                     try { Unregister-Event -SourceIdentifier $eventSource -ErrorAction SilentlyContinue } catch { }
                     try { Get-Job -Name $eventSource -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue } catch { }
@@ -328,6 +376,93 @@ function Write-AtomicText {
     Move-Item -LiteralPath $temporary -Destination $Path -Force
 }
 
+function Test-LoopbackPortAvailable {
+    param([Parameter(Mandatory = $true)][int]$Port)
+    $listener = $null
+    try {
+        $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, $Port)
+        $listener.Start()
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($null -ne $listener) {
+            try { $listener.Stop() } catch { }
+        }
+    }
+}
+
+function Select-GatewayHostPort {
+    if (Test-LoopbackPortAvailable $DefaultGatewayHostPort) { return $DefaultGatewayHostPort }
+    Write-RunProgress "preferred gateway port unavailable port=$DefaultGatewayHostPort; selecting a free loopback port"
+    for ($attempt = 1; $attempt -le 8; $attempt++) {
+        $listener = $null
+        try {
+            $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+            $listener.Start()
+            $candidate = [int]$listener.LocalEndpoint.Port
+            if ($candidate -gt 1024) {
+                Write-RunProgress "gateway loopback port selected port=$candidate attempt=$attempt"
+                return $candidate
+            }
+        } catch {
+            Write-RunProgress "gateway port probe failed attempt=$attempt reason=$($_.Exception.Message)"
+        } finally {
+            if ($null -ne $listener) {
+                try { $listener.Stop() } catch { }
+            }
+        }
+    }
+    throw 'No free loopback port is available for the LocalAIDocker gateway.'
+}
+
+function Get-GatewayHostPort {
+    if (Test-Path -LiteralPath $RuntimeEnv -PathType Leaf) {
+        try {
+            $line = @(Get-Content -LiteralPath $RuntimeEnv -Encoding UTF8 | Where-Object { $_ -match '^LOCALAI_GATEWAY_HOST_PORT=(\d+)$' } | Select-Object -First 1)
+            if ($line.Count -eq 1 -and $line[0] -match '^LOCALAI_GATEWAY_HOST_PORT=(\d+)$') {
+                $port = 0
+                if ([int]::TryParse($Matches[1], [ref]$port) -and $port -ge 1024 -and $port -le 65535) { return $port }
+            }
+        } catch { }
+    }
+    return $DefaultGatewayHostPort
+}
+
+function Test-GatewayPortOwnedByProject {
+    param([Parameter(Mandatory = $true)][int]$Port)
+    try {
+        $inspect = Invoke-Docker @('inspect', "$ComposeProject-gateway-1", '--format', '{{json .NetworkSettings.Ports}}')
+        if ($inspect.ExitCode -ne 0) { return $false }
+        # Docker's JSON port shape places HostPort inside the binding object
+        # rather than in a URL-like string.
+        return ($inspect.Output -match ('"HostPort"\s*:\s*"' + $Port + '"'))
+    } catch {
+        return $false
+    }
+}
+
+function Select-StableGatewayHostPort {
+    # Reuse the current project port during pack installation and normal
+    # rebuilds.  Re-selecting a free port while the owned gateway is still
+    # bound leaves the deployment receipt pointing at the old endpoint and
+    # makes a fresh process report a false server failure.
+    if (Test-Path -LiteralPath $RuntimeEnv -PathType Leaf) {
+        $existing = Get-GatewayHostPort
+        if ($existing -ge 1024 -and $existing -le 65535) {
+            if (Test-GatewayPortOwnedByProject -Port $existing) {
+                Write-RunProgress "reusing project-owned gateway port port=$existing"
+                return $existing
+            }
+            if (Test-LoopbackPortAvailable $existing) {
+                Write-RunProgress "reusing persisted gateway port port=$existing"
+                return $existing
+            }
+        }
+    }
+    return Select-GatewayHostPort
+}
+
 function Get-BackendName {
     if ($Backend) { return $Backend }
     $current = Join-Path $StateRoot 'current-deployment.json'
@@ -341,7 +476,7 @@ function Get-BackendName {
 function Test-DockerEngine {
     Write-RunProgress 'Docker daemon probe started timeout=10s'
     try {
-        $result = Invoke-Docker @('info', '--format', '{{json .}}')
+        $result = Invoke-Docker @('info', '--format', '{{json .}}') -TimeoutSeconds 10
     } catch {
         Write-RunProgress 'Docker daemon probe finished ready=false cli-missing'
         return [pscustomobject]@{ Ready = $false; Code = $Exit.Engine; Reason = $_.Exception.Message; Raw = '' }
@@ -364,6 +499,29 @@ function Test-DockerEngine {
     [pscustomobject]@{ Ready = $true; Reason = 'Docker daemon is reachable.'; Info = $info; Raw = $result.Output }
 }
 
+function Get-DockerDesktopWslSetting {
+    # Docker Desktop keeps the active per-user setting separately from the
+    # installer record.  Prefer the active settings store; an installer
+    # setting from ProgramData can describe how Desktop was installed without
+    # describing the backend currently serving the Docker context.
+    $activeSettings = @(
+        (Join-Path $env:APPDATA 'Docker\settings-store.json'),
+        (Join-Path $env:LOCALAPPDATA 'Docker\settings-store.json')
+    )
+    $fallbackSettings = @((Join-Path $env:PROGRAMDATA 'DockerDesktop\install-settings.json'))
+    foreach ($settingsPath in ($activeSettings + $fallbackSettings)) {
+        if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) { continue }
+        try {
+            $dockerSettings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+            $wslProperty = @($dockerSettings.PSObject.Properties | Where-Object { $_.Name -ieq 'WslEngineEnabled' }) | Select-Object -First 1
+            if ($null -ne $wslProperty) {
+                return [pscustomobject]@{ Known = $true; Enabled = [bool]$wslProperty.Value; Source = $settingsPath }
+            }
+        } catch { }
+    }
+    return [pscustomobject]@{ Known = $false; Enabled = $false; Source = '' }
+}
+
 function Test-Backend {
     param([Parameter(Mandatory = $true)][string]$Name, [switch]$ProbeGpu)
     $engine = Test-DockerEngine
@@ -374,20 +532,8 @@ function Test-Backend {
         if ($context -in @('default', 'desktop-linux') -or [string]$engine.Info.Name -eq 'docker-desktop') {
             return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = 'GPU backend requires an explicitly selected native Linux Docker context; Docker Desktop contexts are not accepted.'; Context = $context }
         }
-        $desktopWslEnabled = $false
-        foreach ($settingsPath in @(
-                (Join-Path $env:APPDATA 'Docker\settings-store.json'),
-                (Join-Path $env:LOCALAPPDATA 'Docker\settings-store.json'),
-                (Join-Path $env:PROGRAMDATA 'DockerDesktop\install-settings.json')
-            )) {
-            if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) { continue }
-            try {
-                $dockerSettings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
-                $wslProperty = @($dockerSettings.PSObject.Properties | Where-Object { $_.Name -ieq 'WslEngineEnabled' }) | Select-Object -First 1
-                if ($null -ne $wslProperty -and [bool]$wslProperty.Value) { $desktopWslEnabled = $true }
-            } catch { }
-        }
-        if ($desktopWslEnabled) {
+        $desktopBackend = Get-DockerDesktopWslSetting
+        if ($desktopBackend.Known -and $desktopBackend.Enabled) {
             return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = 'The selected Docker daemon is Docker Desktop with its WSL2 engine enabled; GPU mode requires native Linux Docker.'; Context = $context }
         }
         if (-not $ProbeGpu) {
@@ -405,37 +551,31 @@ function Test-Backend {
     if ($context -notmatch 'desktop-linux|default') { return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = "Unexpected local Docker context: $context"; Context = $context } }
     $proof = $false
     $proofSource = 'environment'
+    $proofLabel = 'unverified'
     $backendSettingKnown = $false
     $wslBackendDetected = $false
-    $settings = @(
-        (Join-Path $env:APPDATA 'Docker\settings-store.json'),
-        (Join-Path $env:LOCALAPPDATA 'Docker\settings-store.json'),
-        (Join-Path $env:PROGRAMDATA 'DockerDesktop\install-settings.json')
-    )
-    foreach ($settingsPath in $settings) {
-        if (Test-Path -LiteralPath $settingsPath -PathType Leaf) {
-            try {
-                $dockerSettings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
-                $wslProperty = @($dockerSettings.PSObject.Properties | Where-Object { $_.Name -ieq 'WslEngineEnabled' }) | Select-Object -First 1
-                if ($null -ne $wslProperty) {
-                    $backendSettingKnown = $true
-                    if ([bool]$wslProperty.Value) { $wslBackendDetected = $true }
-                    else {
-                        $proof = $true
-                        $proofSource = $settingsPath
-                    }
-                }
-            } catch { }
+    $desktopBackend = Get-DockerDesktopWslSetting
+    if ($desktopBackend.Known) {
+        $backendSettingKnown = $true
+        if ($desktopBackend.Enabled) { $wslBackendDetected = $true }
+        else {
+            $proof = $true
+            $proofSource = 'docker-desktop-active-settings'
+            $proofLabel = 'docker-desktop-hyperv'
         }
     }
     if ($wslBackendDetected) {
         return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = 'Docker Desktop is configured with its WSL2 backend. This project will not use or switch that backend; select a verified Hyper-V backend or an explicit native Linux Docker context.'; Context = $context }
     }
-    if (-not $proof -and -not $backendSettingKnown -and $env:LOCALAI_HYPERV_VERIFIED -eq '1') { $proof = $true }
+    if (-not $proof -and -not $backendSettingKnown -and $env:LOCALAI_HYPERV_VERIFIED -eq '1') {
+        $proof = $true
+        $proofSource = 'explicit-environment'
+        $proofLabel = 'explicit-hyperv-environment'
+    }
     if (-not $proof) {
         return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = 'A non-WSL Docker Desktop backend is not proven. Select Hyper-V and set LOCALAI_HYPERV_VERIFIED=1, or provide a Docker Desktop settings record with WslEngineEnabled=false.'; Context = $context }
     }
-    [pscustomobject]@{ Ready = $true; Code = 0; Backend = $Name; Context = $context; Engine = $engine.Info; BackendProof = $proofSource }
+    [pscustomobject]@{ Ready = $true; Code = 0; Backend = $Name; Context = $context; Engine = $engine.Info; BackendProof = $proofLabel; BackendProofSource = $proofSource }
 }
 
 function Ensure-Secret {
@@ -477,6 +617,7 @@ function Get-HostBridgeKey {
 }
 
 function Test-HostBridge {
+    param([string]$ExpectedScriptHash = '')
     $key = Get-HostBridgeKey
     if ([string]::IsNullOrWhiteSpace($key)) {
         return [pscustomobject]@{ Ready = $false; Reason = 'Host interoperability bridge key is not installed.' }
@@ -485,6 +626,20 @@ function Test-HostBridge {
         $headers = @{ Authorization = 'Bearer ' + $key }
         $health = Invoke-RestMethod -Uri ('http://127.0.0.1:{0}/health' -f $HostBridgePort) -Method Get -Headers $headers -TimeoutSec 3
         if ([string]$health.status -ne 'host-bridge-ready') { throw 'unexpected bridge status' }
+        $expectedRoot = [IO.Path]::GetFullPath($ProjectRoot).TrimEnd('\')
+        $reportedReadRoot = if ($health.PSObject.Properties.Name -contains 'read_root') { [IO.Path]::GetFullPath([string]$health.read_root).TrimEnd('\') } else { '' }
+        $reportedWriteRoot = if ($health.PSObject.Properties.Name -contains 'write_root') { [IO.Path]::GetFullPath([string]$health.write_root).TrimEnd('\') } else { '' }
+        if (-not $reportedReadRoot.Equals($expectedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            return [pscustomobject]@{ Ready = $false; Reason = 'Host bridge read scope is stale or broader than the LocalAIDocker project.'; Health = $health }
+        }
+        if (-not $reportedWriteRoot.Equals($expectedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            return [pscustomobject]@{ Ready = $false; Reason = 'Host bridge write scope is stale or outside the LocalAIDocker project.'; Health = $health }
+        }
+        if ($ExpectedScriptHash -and
+            (($health.PSObject.Properties.Name -notcontains 'script_sha256') -or
+             -not ([string]$health.script_sha256).Equals($ExpectedScriptHash, [StringComparison]::OrdinalIgnoreCase))) {
+            return [pscustomobject]@{ Ready = $false; Reason = 'Host bridge script hash is stale.'; Health = $health }
+        }
         return [pscustomobject]@{ Ready = $true; Reason = 'Host interoperability bridge is ready.'; Health = $health }
     } catch {
         return [pscustomobject]@{ Ready = $false; Reason = $_.Exception.Message }
@@ -514,15 +669,14 @@ function Stop-StaleHostBridge {
 
 function Start-HostBridge {
     Ensure-HostBridgeSecret
-    $currentHash = (Get-FileHash -LiteralPath $HostBridgeScript -Algorithm SHA256).Hash.ToLowerInvariant()
-    $existing = Test-HostBridge
+    $currentHash = Get-FileSha256WithProgress -Path $HostBridgeScript -Label 'host bridge script hash'
+    $existing = Test-HostBridge -ExpectedScriptHash $currentHash
     if ($existing.Ready) {
-        $reportedHash = if ($existing.Health.PSObject.Properties.Name -contains 'script_sha256') { [string]$existing.Health.script_sha256 } else { '' }
-        if ($reportedHash -eq $currentHash) {
-            Write-RunProgress "host bridge ready port=$HostBridgePort reused=true"
-            return $true
-        }
-        Write-RunProgress 'host bridge script changed; replacing the stale target-local bridge'
+        Write-RunProgress "host bridge ready port=$HostBridgePort reused=true"
+        return $true
+    }
+    if ($null -ne $existing.Health) {
+        Write-RunProgress "host bridge is reachable but stale; replacing the project-owned bridge reason=$($existing.Reason)"
         Stop-StaleHostBridge
         Start-Sleep -Milliseconds 250
     }
@@ -534,8 +688,16 @@ function Start-HostBridge {
     New-Item -ItemType Directory -Path $StateRoot -Force | Out-Null
     $stdout = Join-Path $ProjectRoot 'logs\host-bridge.stdout.log'
     $stderr = Join-Path $ProjectRoot 'logs\host-bridge.stderr.log'
-    $powershell = (Get-Command powershell.exe -CommandType Application -ErrorAction Stop).Source
-    Write-RunProgress "host bridge starting port=$HostBridgePort read_root=$([IO.Path]::GetPathRoot($ProjectRoot))"
+    # Resolve the Windows PowerShell 5.1 executable explicitly.  A shim named
+    # powershell.exe may be earlier on PATH in automation hosts and can lack
+    # Get-FileHash/Win32 helpers required by the bridge.
+    $nativePowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $powershell = if (Test-Path -LiteralPath $nativePowerShell -PathType Leaf) {
+        $nativePowerShell
+    } else {
+        (Get-Command powershell.exe -CommandType Application -ErrorAction Stop).Source
+    }
+    Write-RunProgress "host bridge starting port=$HostBridgePort read_root=$ProjectRoot"
     Start-Process -FilePath $powershell -ArgumentList @(
         '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $HostBridgeScript,
         '-Port', [string]$HostBridgePort, '-KeyPath', $HostBridgeKeyPath,
@@ -570,7 +732,9 @@ function Ensure-RuntimeEnv {
     $base = "{0}@{1}" -f $lock.images.agent_base.source_ref, $lock.images.agent_base.digest
     $installed = @(Get-InstalledPacks)
     $agentPacks = ($installed -join ',')
-    $buildPacks = @($installed | Where-Object { $_ -in @('coding', 'media', 'documents') }) -join ','
+    # Optional toolchains are built and supervised as separate services.  The
+    # core gateway/agent image must stay small and must never absorb their apt
+    # dependency graphs.
     if ([string]::IsNullOrWhiteSpace($ModelId)) {
         $existingReceipt = Get-Receipt
         if ($existingReceipt -and $existingReceipt.model_id) { $ModelId = [string]$existingReceipt.model_id }
@@ -581,15 +745,19 @@ function Ensure-RuntimeEnv {
         if ($selected.Count -ne 1) { throw "No verified model fits profile '$Profile'." }
         $ModelId = [string]$selected[0].id
     }
+    $gatewayHostPort = Select-StableGatewayHostPort
     $lines = @(
         "LOCALAI_IMAGE=$cpu",
         "LOCALAI_CPU_IMAGE=$cpu",
         "LOCALAI_GPU_IMAGE=$gpu",
         "AGENT_BASE_IMAGE=$base",
         "AGENT_PACKS=$agentPacks",
-        "INSTALL_PACKS=$buildPacks",
         "MODEL_ID=$ModelId",
         "MODEL_PROFILE=$Profile",
+        "LOCALAI_GATEWAY_HOST_PORT=$gatewayHostPort",
+        "CODING_IMAGE=localaidocker/coding-tools:locked",
+        "MEDIA_IMAGE=localaidocker/media-tools:locked",
+        "DOCUMENTS_IMAGE=localaidocker/documents-tools:locked",
         "HOST_BRIDGE_AVAILABLE=$(if ($HostBridgeAvailable) { '1' } else { '0' })",
         "LOCALAI_API_KEY_FILE=./secrets/localai-api-key",
         "BROWSER_API_KEY_FILE=./secrets/browser-api-key"
@@ -603,6 +771,9 @@ function Get-ComposeArguments {
     $files = @('compose.yaml')
     if ($Name -eq 'hyperv-cpu') { $files += 'compose.cpu.yaml' } else { $files += 'compose.gpu.yaml' }
     $packFiles = @{
+        coding = 'compose.pack-coding.yaml'
+        media = 'compose.pack-media.yaml'
+        documents = 'compose.pack-documents.yaml'
         browser = 'compose.pack-browser.yaml'
         research = 'compose.pack-research.yaml'
     }
@@ -616,6 +787,14 @@ function Get-ComposeArguments {
 
 function Get-AppServices {
     $services = @('localai', 'gateway', 'agent')
+    $serviceByPack = @{
+        coding = 'coding-tools'
+        media = 'media-tools'
+        documents = 'document-tools'
+    }
+    foreach ($packName in Get-InstalledPacks) {
+        if ($serviceByPack.ContainsKey($packName)) { $services += $serviceByPack[$packName] }
+    }
     if ((Get-InstalledPacks) -contains 'browser') { $services += 'browser' }
     return $services
 }
@@ -632,6 +811,90 @@ function Invoke-ComposeLive {
         [Parameter(Mandatory = $true)][string]$Stage
     )
     Invoke-DockerLive ((Get-ComposeArguments $Name) + $Command) $Stage
+}
+
+function Build-CapabilityPackImage {
+    param(
+        [Parameter(Mandatory = $true)][string]$PackName,
+        [Parameter(Mandatory = $true)][string]$Stage
+    )
+    $runtimeLock = Read-JsonFile (Join-Path $ConfigRoot 'runtime.lock.json')
+    $base = "{0}@{1}" -f $runtimeLock.images.agent_base.source_ref, $runtimeLock.images.agent_base.digest
+    $dockerfile = switch ($PackName) {
+        'coding' { 'docker/capability-images/coding/Dockerfile' }
+        'media' { 'docker/capability-images/media/Dockerfile' }
+        'documents' { 'docker/capability-images/documents/Dockerfile' }
+        default { throw "No capability image is defined for pack '$PackName'." }
+    }
+    $imageTag = switch ($PackName) {
+        'coding' { 'localaidocker/coding-tools:locked' }
+        'media' { 'localaidocker/media-tools:locked' }
+        'documents' { 'localaidocker/documents-tools:locked' }
+    }
+    $arguments = @(
+        'build', '--progress=plain', '--pull', '--provenance=false', '--sbom=false',
+        '--build-arg', "BASE_IMAGE=$base",
+        '--tag', $imageTag,
+        '--file', $dockerfile, '.'
+    )
+    return Invoke-DockerLive -Arguments $arguments -Stage $Stage -TimeoutSeconds 1800
+}
+
+function Build-BrowserPackImage {
+    param([Parameter(Mandatory = $true)][string]$Stage)
+    $runtimeLock = Read-JsonFile (Join-Path $ConfigRoot 'runtime.lock.json')
+    $base = "{0}@{1}" -f $runtimeLock.images.agent_base.source_ref, $runtimeLock.images.agent_base.digest
+    $arguments = @(
+        'build', '--progress=plain', '--pull', '--provenance=false', '--sbom=false',
+        '--build-arg', "BASE_IMAGE=$base",
+        '--tag', 'localaidocker/browser:locked',
+        '--file', 'docker/browser/Dockerfile', '.'
+    )
+    return Invoke-DockerLive -Arguments $arguments -Stage $Stage -TimeoutSeconds 1800
+}
+
+function Ensure-InstalledCapabilityImages {
+    $imageByPack = @{
+        coding = 'localaidocker/coding-tools:locked'
+        media = 'localaidocker/media-tools:locked'
+        documents = 'localaidocker/documents-tools:locked'
+        browser = 'localaidocker/browser:locked'
+    }
+    foreach ($packName in Get-InstalledPacks) {
+        if (-not $imageByPack.ContainsKey($packName)) { continue }
+        $image = $imageByPack[$packName]
+        $present = Invoke-Docker @('image', 'inspect', $image)
+        if ($present.ExitCode -eq 0) {
+            Write-RunProgress "installed capability image present pack=$packName image=$image"
+            continue
+        }
+        Write-RunProgress "installed capability image missing pack=$packName; rebuilding the locked capability image"
+        $result = if ($packName -eq 'browser') {
+            Build-BrowserPackImage -Stage 'browser capability image rebuild'
+        } else {
+            Build-CapabilityPackImage -PackName $packName -Stage "$packName capability image rebuild"
+        }
+        if ($result.ExitCode -ne 0) {
+            [Console]::Error.WriteLine("Installed capability image rebuild failed pack=$packName")
+            return (Resolve-DockerOperationFailureCode $result $Exit.Pack)
+        }
+    }
+    return 0
+}
+
+function Resolve-DockerOperationFailureCode {
+    param(
+        [Parameter(Mandatory = $true)]$Result,
+        [Parameter(Mandatory = $true)][int]$FallbackCode
+    )
+    # A Docker Desktop engine can disappear while a Compose operation is
+    # attached.  Probe the daemon before classifying the operation failure so
+    # an engine crash is never reported as a model, server, or configuration
+    # defect.  The probe is read-only and does not start Docker Desktop or
+    # change contexts.
+    $probe = Test-DockerEngine
+    if (-not $probe.Ready) { return [int]$probe.Code }
+    return $FallbackCode
 }
 
 function Get-ApiKey {
@@ -680,7 +943,7 @@ function Invoke-Api {
     param([Parameter(Mandatory = $true)][string]$Path, [string]$Body, [switch]$Authenticated)
     $headers = @{}
     if ($Authenticated) { $headers.Authorization = 'Bearer ' + (Get-ApiKey) }
-    $uri = 'http://127.0.0.1:8080' + $Path
+    $uri = 'http://127.0.0.1:' + (Get-GatewayHostPort) + $Path
     try {
         if ($Body) { return Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -ContentType 'application/json' -Body $Body -TimeoutSec 180 }
         return Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -TimeoutSec 15
@@ -698,15 +961,20 @@ function Invoke-ApiLive {
     )
     $headers = @{}
     if ($Authenticated) { $headers.Authorization = 'Bearer ' + (Get-ApiKey) }
-    $uri = 'http://127.0.0.1:8080' + $Path
+    $uri = 'http://127.0.0.1:' + (Get-GatewayHostPort) + $Path
     $job = $null
     $started = [Diagnostics.Stopwatch]::StartNew()
     try {
+        $requestApiKey = if ($Authenticated) { [string](Get-ApiKey) } else { '' }
+        # Windows PowerShell remoting serializes a Boolean supplied through
+        # Start-Job as a string on some fresh processes.  Use a tiny explicit
+        # wire value so the child job has a deterministic argument contract.
+        $includeExtraUsage = if ($ExtraUsage.IsPresent) { '1' } else { '0' }
         $job = Start-Job -ScriptBlock {
-            param([string]$RequestUri, [string]$RequestBody, [string]$ApiKey, [bool]$IncludeExtraUsage)
+            param([string]$RequestUri, [string]$RequestBody, [string]$ApiKey, [string]$IncludeExtraUsage)
             $requestHeaders = @{}
             if ($ApiKey) { $requestHeaders.Authorization = 'Bearer ' + $ApiKey }
-            if ($IncludeExtraUsage) { $requestHeaders['Extra-Usage'] = 'true' }
+            if ($IncludeExtraUsage -eq '1') { $requestHeaders['Extra-Usage'] = 'true' }
             try {
                 if ($RequestBody) {
                     Invoke-RestMethod -Uri $RequestUri -Method Post -Headers $requestHeaders -ContentType 'application/json' -Body $RequestBody -TimeoutSec 330
@@ -714,16 +982,27 @@ function Invoke-ApiLive {
                     Invoke-RestMethod -Uri $RequestUri -Method Get -Headers $requestHeaders -TimeoutSec 15
                 }
             } catch { }
-        } -ArgumentList $uri, $Body, $(if ($Authenticated) { Get-ApiKey } else { '' }), [bool]$ExtraUsage
-        while ($job.State -eq 'Running' -and $started.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        } -ArgumentList @($uri, $Body, $requestApiKey, $includeExtraUsage)
+        # Start-Job can remain NotStarted briefly on a fresh Windows
+        # PowerShell process.  Treat that as active work; inspecting the job
+        # before it reaches Running otherwise turns a valid inference into a
+        # false null response.
+        while ($job.State -in @('NotStarted', 'Running', 'Blocked') -and $started.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
             Start-Sleep -Milliseconds 500
             if ($started.ElapsedMilliseconds -ge 1000) {
                 Write-RunProgress "$Label waiting elapsed_ms=$($started.ElapsedMilliseconds)"
             }
         }
-        if ($job.State -eq 'Running') {
+        if ($job.State -in @('NotStarted', 'Running', 'Blocked')) {
             Stop-Job -Job $job -ErrorAction SilentlyContinue | Out-Null
             Write-RunProgress "$Label timed out elapsed_ms=$($started.ElapsedMilliseconds)"
+            return $null
+        }
+        if ($job.State -eq 'Failed') {
+            $failure = ''
+            try { $failure = [string]$job.ChildJobs[0].JobStateInfo.Reason.Message } catch { }
+            if ([string]::IsNullOrWhiteSpace($failure)) { $failure = 'PowerShell request job failed.' }
+            Write-RunProgress "$Label failed reason=$failure"
             return $null
         }
         $result = Receive-Job -Job $job -ErrorAction SilentlyContinue | Select-Object -Last 1
@@ -744,9 +1023,10 @@ function Get-Receipt {
 function Wait-ForGateway {
     param([int]$Attempts = 60, [int]$DelaySeconds = 2)
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-        Write-RunProgress "health check attempt=$attempt/$Attempts endpoint=http://127.0.0.1:8080/health"
+        $gatewayPort = Get-GatewayHostPort
+        Write-RunProgress "health check attempt=$attempt/$Attempts endpoint=http://127.0.0.1:$gatewayPort/health"
         $health = Invoke-Api '/health'
-        if ($null -ne $health) {
+        if ($null -ne $health -and [string]$health.status -eq 'gateway-ready') {
             Write-RunProgress 'gateway health=ready'
             return $health
         }
@@ -764,7 +1044,15 @@ function Test-LocalImages {
     } else {
         "{0}@{1}" -f $runtimeLock.images.localai_cpu.source_ref, $runtimeLock.images.localai_cpu.digest
     }
-    $required = @($localAi, 'localaidocker/gateway:locked', 'localaidocker/agent:locked')
+    $required = @($localAi, 'localaidocker/gateway:locked', 'localaidocker/agent:locked', 'localaidocker/model-manager:locked')
+    $packImages = @{
+        coding = 'localaidocker/coding-tools:locked'
+        media = 'localaidocker/media-tools:locked'
+        documents = 'localaidocker/documents-tools:locked'
+    }
+    foreach ($packName in Get-InstalledPacks) {
+        if ($packImages.ContainsKey($packName)) { $required += $packImages[$packName] }
+    }
     if ((Get-InstalledPacks) -contains 'browser') { $required += 'localaidocker/browser:locked' }
     $imageIds = [ordered]@{}
     foreach ($image in $required) {
@@ -784,17 +1072,75 @@ function Test-LocalImages {
     [pscustomobject]@{ Ready = $true; Code = 0; Reason = 'All verified runtime images are present locally.'; Images = $imageIds }
 }
 
+function Get-ReceiptImageIdentity {
+    param(
+        [Parameter(Mandatory = $true)]$Receipt,
+        [Parameter(Mandatory = $true)][string]$Image
+    )
+    if ($null -eq $Receipt -or $Receipt.PSObject.Properties.Name -notcontains 'image_ids' -or $null -eq $Receipt.image_ids) { return $null }
+    $property = @($Receipt.image_ids.PSObject.Properties | Where-Object Name -eq $Image | Select-Object -First 1)
+    if ($property.Count -ne 1) { return $null }
+    return [string]$property[0].Value
+}
+
+function Normalize-ImageIdentity {
+    param(
+        [Parameter(Mandatory = $true)][string]$Image,
+        [AllowNull()][string]$Identity
+    )
+    if ([string]::IsNullOrWhiteSpace($Identity)) { return '' }
+    if ($Image -match '@sha256:') {
+        try {
+            $digests = @($Identity | ConvertFrom-Json | ForEach-Object { [string]$_ } | Sort-Object)
+            if ($digests.Count -gt 0) { return ($digests -join '|').ToLowerInvariant() }
+        } catch { }
+    }
+    return $Identity.Trim().ToLowerInvariant()
+}
+
+function Test-ReceiptImageIdentities {
+    param(
+        [Parameter(Mandatory = $true)]$Receipt,
+        [Parameter(Mandatory = $true)]$ImageResult
+    )
+    if ($Receipt.PSObject.Properties.Name -notcontains 'image_ids' -or $null -eq $Receipt.image_ids) {
+        return [pscustomobject]@{ Ready = $false; Code = $Exit.Provenance; Reason = 'Deployment receipt has no recorded image identities.' }
+    }
+    foreach ($imageProperty in $ImageResult.Images.GetEnumerator()) {
+        $image = [string]$imageProperty.Key
+        $recorded = Get-ReceiptImageIdentity -Receipt $Receipt -Image $image
+        if ([string]::IsNullOrWhiteSpace($recorded)) {
+            return [pscustomobject]@{ Ready = $false; Code = $Exit.Provenance; Reason = "Deployment receipt has no identity for image '$image'." }
+        }
+        $current = [string]$imageProperty.Value
+        if ((Normalize-ImageIdentity -Image $image -Identity $recorded) -ne (Normalize-ImageIdentity -Image $image -Identity $current)) {
+            return [pscustomobject]@{ Ready = $false; Code = $Exit.Provenance; Reason = "Image identity for '$image' differs from the deployment receipt." }
+        }
+    }
+    [pscustomobject]@{ Ready = $true; Code = 0; Reason = 'Recorded runtime image identities match the local images.' }
+}
+
 function Test-EnabledPackServices {
     $installed = @(Get-InstalledPacks)
-    if ($installed -notcontains 'browser') {
+    $serviceByPack = @{
+        coding = 'coding-tools'
+        media = 'media-tools'
+        documents = 'document-tools'
+        browser = 'browser'
+    }
+    $servicePacks = @($installed | Where-Object { $serviceByPack.ContainsKey($_) })
+    if ($servicePacks.Count -eq 0) {
         return [pscustomobject]@{ Ready = $true; Code = 0; Reason = 'No service-backed optional pack is enabled.' }
     }
-    Write-RunProgress 'browser pack service health probe started'
-    $running = Invoke-Compose (Get-BackendName) @('ps', '--status', 'running', '--services', 'browser')
-    if ($running.ExitCode -ne 0 -or $running.Output.Trim() -notmatch '(?m)^browser\s*$') {
-        return [pscustomobject]@{ Ready = $false; Code = $Exit.Pack; Reason = 'The installed browser service is not running.'; Raw = $running.Output }
+    foreach ($packName in $servicePacks) {
+        $service = $serviceByPack[$packName]
+        Write-RunProgress "$packName pack service health probe started"
+        $running = Invoke-Compose (Get-BackendName) @('ps', '--status', 'running', '--services', $service)
+        if ($running.ExitCode -ne 0 -or $running.Output.Trim() -notmatch ("(?m)^" + [regex]::Escape($service) + "\s*$")) {
+            return [pscustomobject]@{ Ready = $false; Code = $Exit.Pack; Reason = "The installed $packName service is not running."; Raw = $running.Output }
+        }
+        Write-RunProgress "$packName pack service health probe finished ready=true"
     }
-    Write-RunProgress 'browser pack service health probe finished ready=true'
     return [pscustomobject]@{ Ready = $true; Code = 0; Reason = 'Enabled optional services are running.' }
 }
 
@@ -829,6 +1175,9 @@ function Test-Ready {
             return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = 'The deployment does not contain a verified NVIDIA container-runtime and GPU acceptance proof.'; Backend = $name; Receipt = $receipt }
         }
     }
+    if ($name -eq 'hyperv-cpu' -and [string]$receipt.backend_proof -notin @('docker-desktop-hyperv', 'explicit-hyperv-environment')) {
+        return [pscustomobject]@{ Ready = $false; Code = $Exit.Backend; Reason = 'The deployment receipt does not contain a recognized non-WSL Hyper-V backend proof. Run the normal launcher after verifying the Docker Desktop backend.'; Backend = $name; Receipt = $receipt }
+    }
     try {
         $runtimeLock = Read-JsonFile (Join-Path $ConfigRoot 'runtime.lock.json')
         $expectedImageDigest = if ($name -eq 'native-linux-gpu') { [string]$runtimeLock.images.localai_gpu.digest } else { [string]$runtimeLock.images.localai_cpu.digest }
@@ -850,12 +1199,16 @@ function Test-Ready {
     }
     $images = Test-LocalImages $name
     if (-not $images.Ready) { return [pscustomobject]@{ Ready = $false; Code = $images.Code; Reason = $images.Reason; Backend = $name; Details = $images } }
+    $imageIdentities = Test-ReceiptImageIdentities -Receipt $receipt -ImageResult $images
+    if (-not $imageIdentities.Ready) { return [pscustomobject]@{ Ready = $false; Code = $imageIdentities.Code; Reason = $imageIdentities.Reason; Backend = $name; Details = $imageIdentities } }
     $packServices = Test-EnabledPackServices
     if (-not $packServices.Ready) { return [pscustomobject]@{ Ready = $false; Code = $packServices.Code; Reason = $packServices.Reason; Backend = $name; Details = $packServices } }
     $compose = Invoke-Compose $name @('config', '--quiet')
     if ($compose.ExitCode -ne 0) { return [pscustomobject]@{ Ready = $false; Code = $Exit.Provenance; Reason = 'Compose configuration is invalid.'; Details = $compose.Output } }
     $health = Invoke-Api '/health'
-    if ($null -eq $health) { return [pscustomobject]@{ Ready = $false; Code = $Exit.Server; Reason = 'Gateway health endpoint is unavailable.'; Backend = $name } }
+    if ($null -eq $health -or [string]$health.status -ne 'gateway-ready') {
+        return [pscustomobject]@{ Ready = $false; Code = $Exit.Server; Reason = 'The project gateway health endpoint is unavailable or the configured port belongs to another service.'; Backend = $name }
+    }
     $bridge = Test-HostBridge
     $bridgeReason = if ($bridge.Ready) { 'Verified Docker runtime and host interoperability bridge are ready.' } else { 'Verified Docker runtime is ready; optional host interoperability is unavailable: ' + $bridge.Reason }
     [pscustomobject]@{ Ready = $true; Code = 0; Reason = $bridgeReason; Backend = $name; Receipt = $receipt; Health = $health; HostBridge = $bridge; HostBridgeAvailable = [bool]$bridge.Ready }
@@ -881,6 +1234,8 @@ function Install-Core {
     $backend = Test-Backend $Name -ProbeGpu
     if (-not $backend.Ready) { Show-Status $backend; return $backend.Code }
     $modelLock = Read-JsonFile (Join-Path $ConfigRoot 'models.lock.json')
+    $runtimeLock = Read-JsonFile (Join-Path $ConfigRoot 'runtime.lock.json')
+    $base = "{0}@{1}" -f $runtimeLock.images.agent_base.source_ref, $runtimeLock.images.agent_base.digest
     $modelEntry = @($modelLock.models | Where-Object { @($_.profiles) -contains $Profile } | Select-Object -First 1)
     if ($modelEntry.Count -ne 1) {
         [Console]::Error.WriteLine("No verified model fits profile '$Profile'.")
@@ -900,32 +1255,76 @@ function Install-Core {
     Write-RunProgress 'creating target-local runtime credentials and environment'
     Ensure-RuntimeEnv -ModelId $modelId
     $config = Invoke-ComposeLive $Name @('config', '--quiet') 'Compose validation'
-    if ($config.ExitCode -ne 0) { [Console]::Error.WriteLine($config.Output); return $Exit.Install }
-    $pull = $null
-    for ($pullAttempt = 1; $pullAttempt -le 2; $pullAttempt++) {
-        $pull = Invoke-ComposeLive $Name @('pull', 'localai') ("LocalAI image pull attempt=$pullAttempt/2")
-        if ($pull.ExitCode -eq 0) { break }
-        if ($pullAttempt -lt 2) {
-            Write-RunProgress 'LocalAI image pull transient failure; retrying once'
-            Start-Sleep -Seconds 2
-        }
+    if ($config.ExitCode -ne 0) { [Console]::Error.WriteLine($config.Output); return (Resolve-DockerOperationFailureCode $config $Exit.Install) }
+    $localAiRef = if ($Name -eq 'native-linux-gpu') {
+        "{0}@{1}" -f $runtimeLock.images.localai_gpu.source_ref, $runtimeLock.images.localai_gpu.digest
+    } else {
+        "{0}@{1}" -f $runtimeLock.images.localai_cpu.source_ref, $runtimeLock.images.localai_cpu.digest
     }
-    if ($null -eq $pull -or $pull.ExitCode -ne 0) { [Console]::Error.WriteLine($pull.Output); return $Exit.Install }
+    $localAiPresent = Invoke-Docker @('image', 'inspect', $localAiRef)
+    if ($localAiPresent.ExitCode -eq 0) {
+        Write-RunProgress "LocalAI image already present and locked image reference verified image=$localAiRef"
+    } else {
+        # Pull only when the exact locked image is absent.  Re-downloading a
+        # verified immutable image on every normal rebuild adds latency and
+        # needlessly stresses Docker Desktop's engine.  A transient daemon or
+        # registry failure gets bounded retries with a fresh engine probe.
+        $pull = $null
+        for ($pullAttempt = 1; $pullAttempt -le 3; $pullAttempt++) {
+            $pull = Invoke-ComposeLive $Name @('pull', 'localai') ("LocalAI image pull attempt=$pullAttempt/3")
+            if ($pull.ExitCode -eq 0) { break }
+            if ($pullAttempt -lt 3) {
+                Write-RunProgress "LocalAI image pull transient failure; retrying attempt=$($pullAttempt + 1)/3"
+                Start-Sleep -Seconds ([Math]::Min(8, [int]([Math]::Pow(2, $pullAttempt))))
+                $engineAfterPullFailure = Test-DockerEngine
+                if (-not $engineAfterPullFailure.Ready) {
+                    [Console]::Error.WriteLine($engineAfterPullFailure.Reason)
+                    return $Exit.Engine
+                }
+            }
+        }
+        if ($null -eq $pull -or $pull.ExitCode -ne 0) { [Console]::Error.WriteLine($pull.Output); return (Resolve-DockerOperationFailureCode $pull $Exit.Install) }
+    }
+    # Service-backed packs own their image builds in Install-Packs.  Core
+    # installation must rebuild only the three images for which this function
+    # has a direct, deterministic Dockerfile mapping.  A previously verified
+    # browser image is validated by Test-LocalImages and recreated by Compose;
+    # trying to treat it as a core image build causes unrelated installs (for
+    # example research) to fail with a false "no direct build definition"
+    # error.
     $buildServices = @('gateway', 'agent', 'model-manager')
-    if ((Get-InstalledPacks) -contains 'browser') { $buildServices += 'browser' }
-    $build = Invoke-ComposeLive $Name (@('--progress', 'plain', 'build', '--pull') + $buildServices) 'agent image build'
-    if ($build.ExitCode -ne 0) { [Console]::Error.WriteLine($build.Output); return $Exit.Install }
+    # Local Docker Desktop builds can fail while Compose cleans up its
+    # automatically generated attestation metadata on a Windows-mounted temp
+    # path.  Some Compose installations delegate even a single service to
+    # Bake despite COMPOSE_BAKE=false.  Build the three core images directly
+    # with the Docker Engine so Compose is not involved in image export; the
+    # images remain local-only and are verified below by their image IDs plus
+    # the locked base-image digest.
+    foreach ($buildService in $buildServices) {
+        if ($buildService -notin @('gateway', 'agent', 'model-manager')) {
+            [Console]::Error.WriteLine("No direct Docker build definition is available for service '$buildService'.")
+            return $Exit.Pack
+        }
+        $dockerfile = if ($buildService -eq 'model-manager') { 'docker/model-manager/Dockerfile' } else { 'docker/agent/Dockerfile' }
+        $imageTag = "localaidocker/$buildService`:locked"
+        $buildArguments = @('build', '--progress=plain', '--pull', '--provenance=false', '--sbom=false', '--build-arg', "BASE_IMAGE=$base")
+        $buildArguments += @('--tag', $imageTag, '--file', $dockerfile, '.')
+        $build = Invoke-DockerLive -Arguments $buildArguments -Stage ("direct Docker image build service=$buildService")
+        if ($build.ExitCode -ne 0) { [Console]::Error.WriteLine($build.Output); return (Resolve-DockerOperationFailureCode $build $Exit.Install) }
+    }
+    $capabilityImages = Ensure-InstalledCapabilityImages
+    if ($capabilityImages -ne 0) { return $capabilityImages }
     $images = Test-LocalImages $Name
     if (-not $images.Ready) { [Console]::Error.WriteLine($images.Reason); return $Exit.Provenance }
     $model = Invoke-ComposeLive $Name @('--profile', 'install', 'run', '--rm', 'model-manager') 'locked model and data verification'
-    if ($model.ExitCode -ne 0) { [Console]::Error.WriteLine($model.Output); return $Exit.Model }
+    if ($model.ExitCode -ne 0) { [Console]::Error.WriteLine($model.Output); return (Resolve-DockerOperationFailureCode $model $Exit.Model) }
     # The selected model configuration is promoted immediately before this
     # step. Recreate every application container so a model/profile change can
     # never leave a healthy-looking server running the previous model.
     $upCommand = @('up', '-d', '--force-recreate')
     $upCommand += @('--pull', 'never', '--no-build') + (Get-AppServices)
     $up = Invoke-ComposeLive $Name $upCommand 'Docker application start and container recreation'
-    if ($up.ExitCode -ne 0) { [Console]::Error.WriteLine($up.Output); return $Exit.Install }
+    if ($up.ExitCode -ne 0) { [Console]::Error.WriteLine($up.Output); return (Resolve-DockerOperationFailureCode $up $Exit.Install) }
     $ready = Wait-ForGateway
     if ($null -eq $ready) { [Console]::Error.WriteLine('Gateway did not become healthy.'); return $Exit.Server }
     $body = @{ model = $modelId; messages = @(@{ role = 'user'; content = 'Reply with exactly LOCALAI_CORE_OK.' }); temperature = 0; stream = $false } | ConvertTo-Json -Depth 8
@@ -975,7 +1374,7 @@ function Install-Core {
         schema_version = 1; deployment_id = ('deploy-' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))
         backend = $Name; model_id = $modelId; profile = $Profile; image_digest = $imageDigest
         image_ids = $images.Images
-        docker_context = [string]$backend.Context; engine_os_type = [string]$backend.Engine.OSType; backend_proof = $backendProof
+        docker_context = [string]$backend.Context; engine_os_type = [string]$backend.Engine.OSType; backend_proof = $backendProof; backend_proof_source = if ($backend.PSObject.Properties.Name -contains 'BackendProofSource') { [string]$backend.BackendProofSource } else { 'gpu-passthrough-probe' }; gateway_host_port = [int](Get-GatewayHostPort)
         model_revision = [string]$modelEntry[0].revision; model_artifact_sha256 = $artifactHash; model_artifact_size_bytes = [int64]$artifact[0].size_bytes
         packs = $packs; benchmark = $benchmark; created_at = (Get-Date).ToUniversalTime().ToString('o'); acceptance = 'core-inference-and-profile-benchmark-passed'
     }
@@ -1034,16 +1433,21 @@ function Install-Packs {
             if ($installed -notcontains $packName) { $installed += $packName }
             Save-InstalledPacks $installed
             Ensure-RuntimeEnv
-            if ($packName -in @('coding', 'media', 'documents', 'browser')) {
-                $buildServices = @('gateway', 'agent')
-                if ($packName -eq 'browser') { $buildServices += 'browser' }
-                $build = Invoke-ComposeLive $Name (@('--progress', 'plain', 'build', '--pull') + $buildServices) ("$packName pack image build")
-                if ($build.ExitCode -ne 0) {
-                    Save-InstalledPacks $previous
-                    Ensure-RuntimeEnv
-                    [Console]::Out.WriteLine("LOCALAI_DOCKER_PACK_UNAVAILABLE pack=$packName reason=capability image build failed")
-                    return $Exit.Pack
-                }
+            $build = $null
+            if ($packName -in @('coding', 'media', 'documents')) {
+                # Toolchains are independent runner images.  Building them
+                # separately keeps the core gateway/agent image small and
+                # prevents an optional apt graph from destabilizing the core
+                # Docker Desktop export path.
+                $build = Build-CapabilityPackImage -PackName $packName -Stage "$packName capability image build"
+            } elseif ($packName -eq 'browser') {
+                $build = Build-BrowserPackImage -Stage 'browser pack image build'
+            }
+            if ($null -ne $build -and $build.ExitCode -ne 0) {
+                Save-InstalledPacks $previous
+                Ensure-RuntimeEnv
+                [Console]::Out.WriteLine("LOCALAI_DOCKER_PACK_UNAVAILABLE pack=$packName reason=capability image build failed")
+                return $Exit.Pack
             }
             $up = Invoke-ComposeLive $Name (@('up', '-d', '--force-recreate', '--pull', 'never', '--no-build') + (Get-AppServices)) ("$packName pack activation")
             if ($up.ExitCode -ne 0) {
@@ -1131,7 +1535,7 @@ function Start-Interactive {
     $modelId = [string]$status.Receipt.model_id
     Write-RunProgress "interactive mode starting backend=$Name model=$modelId"
     $bridgeState = if ($status.PSObject.Properties.Name -contains 'HostBridgeAvailable' -and $status.HostBridgeAvailable) { 'ready' } else { 'unavailable' }
-    [Console]::Out.WriteLine("LOCALAI_INTERACTIVE_READY backend=$Name model=$modelId host_bridge=$bridgeState endpoint=http://127.0.0.1:8080")
+    [Console]::Out.WriteLine("LOCALAI_INTERACTIVE_READY backend=$Name model=$modelId host_bridge=$bridgeState endpoint=http://127.0.0.1:$(Get-GatewayHostPort)")
     [Console]::Out.WriteLine('Type /help for commands, /exit to stop. Enter a message to chat.')
     while ($true) {
         try {

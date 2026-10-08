@@ -3,13 +3,17 @@ from __future__ import annotations
 import hmac
 import os
 import pathlib
+import time
 import urllib.parse
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .logging_utils import configure_logging, emit_event
+
 
 MAX_BODY = 20_000_000
+LOGGER = configure_logging("gateway")
 
 
 def secret() -> str:
@@ -31,6 +35,10 @@ def host_bridge_secret() -> str:
 class Gateway(BaseHTTPRequestHandler):
     server_version = "LocalAIDockerGateway/1"
 
+    def __init__(self, request, client_address, server):
+        self._started_at = time.monotonic()
+        super().__init__(request, client_address, server)
+
     def log_message(self, fmt: str, *args: object) -> None:
         return
 
@@ -51,6 +59,13 @@ class Gateway(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+        emit_event(
+            LOGGER,
+            "gateway_response",
+            route=urllib.parse.urlsplit(self.path).path[:128],
+            status=code,
+            elapsed_ms=round((time.monotonic() - self._started_at) * 1000, 1),
+        )
 
     def do_GET(self) -> None:
         if self.path in {"/health", "/readyz"}:
@@ -132,6 +147,9 @@ class Gateway(BaseHTTPRequestHandler):
         request = urllib.request.Request(base + target_path, data=body, method=method)
         request.add_header("Authorization", self.headers.get("Authorization", ""))
         request.add_header("Content-Type", self.headers.get("Content-Type", "application/json"))
+        user_intent = self.headers.get("X-LocalAIDocker-User-Intent", "")
+        if user_intent:
+            request.add_header("X-LocalAIDocker-User-Intent", user_intent)
         try:
             request_timeout = 330 if parsed.path == "/host-bridge/v1/files/list" else 35
             with urllib.request.urlopen(request, timeout=request_timeout) as response:
@@ -144,7 +162,13 @@ class Gateway(BaseHTTPRequestHandler):
 
 def main() -> None:
     host, port_text = os.environ.get("GATEWAY_BIND", "0.0.0.0:8080").rsplit(":", 1)
-    ThreadingHTTPServer((host, int(port_text)), Gateway).serve_forever()
+    server = ThreadingHTTPServer((host, int(port_text)), Gateway)
+    emit_event(LOGGER, "gateway_started", bind=host, listen_port=int(port_text))
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        emit_event(LOGGER, "gateway_stopped")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shlex
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -12,11 +13,13 @@ from .policy import PolicyError
 from .server_client import LocalAIError, request
 from .task_state import save_checkpoint
 from .tool_registry import REGISTRY, enabled_tools, execute_tool
+from .logging_utils import configure_logging, emit_event, identifier_hash
 
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 WINDOWS_PATH_RE = re.compile(r"\b([A-Za-z]:\\[^\s<>\"']*)", re.IGNORECASE)
 QUOTED_WINDOWS_PATH_RE = re.compile(r"['\"]([A-Za-z]:\\[^'\"]+)['\"]", re.IGNORECASE)
+LOGGER = configure_logging("agent")
 
 
 def _packs() -> set[str]:
@@ -274,6 +277,10 @@ def handle_message(message: str, model: str) -> dict[str, Any]:
 
 
 class Agent(BaseHTTPRequestHandler):
+    def __init__(self, request, client_address, server):
+        self._started_at = time.monotonic()
+        super().__init__(request, client_address, server)
+
     def log_message(self, fmt: str, *args: object) -> None:
         return
 
@@ -285,6 +292,14 @@ class Agent(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+        emit_event(
+            LOGGER,
+            "agent_response",
+            route=self.path.split("?", 1)[0][:128],
+            status=code,
+            elapsed_ms=round((time.monotonic() - self._started_at) * 1000, 1),
+            tool_count=len(payload.get("tools_used", [])) if isinstance(payload, dict) else 0,
+        )
 
     def do_GET(self) -> None:
         if self.path == "/health":
@@ -304,21 +319,38 @@ class Agent(BaseHTTPRequestHandler):
             message = str(payload.get("message", "")).strip()
             if not message:
                 raise ValueError("message is required")
+            task_id = str(payload.get("task_id", "adhoc"))
+            task_ref = identifier_hash(task_id)
+            emit_event(LOGGER, "agent_task_started", task_ref=task_ref, input_chars=len(message))
             requested_model = str(payload.get("model", os.environ.get("MODEL_ID", "qwen25-coder-1.5b-q4km")))
             model = _verified_model(requested_model)
             result = handle_message(message, model)
-            task_id = str(payload.get("task_id", "adhoc"))
             save_checkpoint(task_id, {"status": "completed", "model": model, "tools_used": result.get("tools_used", [])})
+            emit_event(
+                LOGGER,
+                "agent_task_completed",
+                task_ref=task_ref,
+                tool_count=len(result.get("tools_used", [])),
+                answer_chars=len(str(result.get("choices", [{}])[0].get("message", {}).get("content", ""))),
+            )
             self._reply(200, result)
         except (ValueError, LocalAIError, PolicyError, json.JSONDecodeError) as exc:
+            emit_event(LOGGER, "agent_task_rejected", error_type=type(exc).__name__)
             self._reply(400, {"error": str(exc)})
         except Exception as exc:  # keep the service alive and make unexpected failures visible
+            emit_event(LOGGER, "agent_task_failed", error_type=type(exc).__name__)
             self._reply(500, {"error": f"agent failure: {exc}"})
 
 
 def main() -> None:
     host, port_text = os.environ.get("AGENT_BIND", "0.0.0.0:8090").rsplit(":", 1)
-    ThreadingHTTPServer((host, int(port_text)), Agent).serve_forever()
+    server = ThreadingHTTPServer((host, int(port_text)), Agent)
+    emit_event(LOGGER, "agent_started", bind=host, listen_port=int(port_text), pack_count=len(_packs()))
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        emit_event(LOGGER, "agent_stopped")
 
 
 if __name__ == "__main__":

@@ -170,37 +170,62 @@ function Test-AcceptanceBackendPolicy {
         return [pscustomobject]@{ Ready = $true; Context = $context; Reason = 'Selected backend is not the local Hyper-V CPU policy.' }
     }
 
-    $settingsPaths = @(
+    $activeSettingsPaths = @(
         (Join-Path $env:APPDATA 'Docker\settings-store.json'),
-        (Join-Path $env:LOCALAPPDATA 'Docker\settings-store.json'),
-        'C:\ProgramData\DockerDesktop\install-settings.json'
+        (Join-Path $env:LOCALAPPDATA 'Docker\settings-store.json')
     )
+    $fallbackSettingsPaths = @((Join-Path $env:PROGRAMDATA 'DockerDesktop\install-settings.json'))
     $settingFound = $false
     $wslEngineEnabled = $false
-    $wslEngineExplicitlyEnabled = $false
-    $wslEngineExplicitlyDisabled = $false
-    foreach ($settingsPath in $settingsPaths) {
+    foreach ($settingsPath in ($activeSettingsPaths + $fallbackSettingsPaths)) {
         if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) { continue }
         try {
             $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
             $property = @($settings.PSObject.Properties | Where-Object { $_.Name -ieq 'WslEngineEnabled' }) | Select-Object -First 1
             if ($null -ne $property) {
                 $settingFound = $true
-                if ([bool]$property.Value) { $wslEngineExplicitlyEnabled = $true }
-                else { $wslEngineExplicitlyDisabled = $true }
+                $wslEngineEnabled = [bool]$property.Value
+                break
             }
         } catch { }
     }
-    if ($wslEngineExplicitlyEnabled) {
+    if ($settingFound -and $wslEngineEnabled) {
         return [pscustomobject]@{ Ready = $false; Context = $context; Reason = 'Docker Desktop is configured with its WSL2 backend; runtime acceptance is not valid for this no-WSL2 project.' }
     }
-    if ($settingFound -and $wslEngineExplicitlyDisabled) {
+    if ($settingFound -and -not $wslEngineEnabled) {
         return [pscustomobject]@{ Ready = $true; Context = $context; Reason = 'Docker Desktop non-WSL backend is explicitly recorded.' }
     }
     if ($env:LOCALAI_HYPERV_VERIFIED -eq '1') {
         return [pscustomobject]@{ Ready = $true; Context = $context; Reason = 'Hyper-V backend was explicitly asserted by the user environment.' }
     }
     return [pscustomobject]@{ Ready = $false; Context = $context; Reason = 'A non-WSL Docker Desktop backend is not proven; refusing to accept runtime behavior.' }
+}
+
+function Get-AcceptanceGatewayBase {
+    param([Parameter(Mandatory = $true)]$Receipt)
+    $port = 0
+    try {
+        # The Compose environment is the live source of truth for the host
+        # binding.  Prefer it over a stale receipt left by an older pack
+        # activation, then fall back to the receipt for backward compatibility.
+        if (Test-Path -LiteralPath $runtimeEnv -PathType Leaf) {
+            $line = @(Get-Content -LiteralPath $runtimeEnv -Encoding UTF8 | Where-Object { $_ -match '^LOCALAI_GATEWAY_HOST_PORT=(\d+)$' } | Select-Object -First 1)
+            if ($line.Count -eq 1 -and $line[0] -match '^LOCALAI_GATEWAY_HOST_PORT=(\d+)$') { $port = [int]$Matches[1] }
+        }
+        if ($port -lt 1024 -or $port -gt 65535 -or $port -eq 8080) {
+            if ($Receipt.PSObject.Properties.Name -contains 'gateway_host_port') { $port = [int]$Receipt.gateway_host_port }
+        }
+    } catch { $port = 0 }
+    if ($port -lt 1024 -or $port -gt 65535) {
+        if (Test-Path -LiteralPath $runtimeEnv -PathType Leaf) {
+            try {
+                $line = @(Get-Content -LiteralPath $runtimeEnv -Encoding UTF8 | Where-Object { $_ -match '^LOCALAI_GATEWAY_HOST_PORT=(\d+)$' } | Select-Object -First 1)
+                if ($line.Count -eq 1 -and $line[0] -match '^LOCALAI_GATEWAY_HOST_PORT=(\d+)$') { $port = [int]$Matches[1] }
+            } catch { $port = 0 }
+        }
+    }
+    if ($port -lt 1024 -or $port -gt 65535) { return $null }
+    return 'http://127.0.0.1:' + $port
 }
 
 $docker = Get-AcceptanceDocker
@@ -243,6 +268,9 @@ if (-not $docker) {
         }
         $composeArgs = @('compose', '--env-file', $runtimeEnv, '-f', (Join-Path $root 'compose.yaml'))
         if ($backendName -eq 'native-linux-gpu') { $composeArgs += @('-f', (Join-Path $root 'compose.gpu.yaml')) } else { $composeArgs += @('-f', (Join-Path $root 'compose.cpu.yaml')) }
+        if ($installedPackNames -contains 'coding') { $composeArgs += @('-f', (Join-Path $root 'compose.pack-coding.yaml')) }
+        if ($installedPackNames -contains 'media') { $composeArgs += @('-f', (Join-Path $root 'compose.pack-media.yaml')) }
+        if ($installedPackNames -contains 'documents') { $composeArgs += @('-f', (Join-Path $root 'compose.pack-documents.yaml')) }
         if ($installedPackNames -contains 'browser') { $composeArgs += @('-f', (Join-Path $root 'compose.pack-browser.yaml')) }
         if ($installedPackNames -contains 'research') { $composeArgs += @('-f', (Join-Path $root 'compose.pack-research.yaml')) }
         $composeArgs += @('config', '--quiet')
@@ -266,14 +294,22 @@ if (-not $docker) {
                 Add-Result 'model-artifact-integrity' 'passed' 'Model size and SHA-256 match the lock.'
             } catch { Add-Result 'model-artifact-integrity' 'failed' $_.Exception.Message }
 
+            $gatewayBase = Get-AcceptanceGatewayBase $receipt
             $health = $null
-            try { $health = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8080/health' -TimeoutSec 10 -ErrorAction Stop } catch { }
-            if ($health -and $health.StatusCode -eq 200) { Add-Result 'gateway-health' 'passed' 'Loopback gateway health is reachable.' }
-            else { Add-Result 'gateway-health' 'failed' 'Loopback gateway health is unavailable.' }
+            $gatewayIdentity = $false
+            if ($gatewayBase) {
+                try {
+                    $health = Invoke-WebRequest -UseBasicParsing -Uri ($gatewayBase + '/health') -TimeoutSec 10 -ErrorAction Stop
+                    $healthBody = $health.Content | ConvertFrom-Json
+                    $gatewayIdentity = [string]$healthBody.status -eq 'gateway-ready'
+                } catch { }
+            }
+            if ($health -and $health.StatusCode -eq 200 -and $gatewayIdentity) { Add-Result 'gateway-health' 'passed' "Verified project gateway health is reachable at $gatewayBase." }
+            else { Add-Result 'gateway-health' 'failed' 'The verified project gateway health endpoint is unavailable or returned another service response.' }
 
             $body = @{ model = [string]$receipt.model_id; messages = @(@{ role = 'user'; content = 'Reply with exactly ACCEPTANCE_CORE_OK.' }); max_tokens = 16; stream = $false } | ConvertTo-Json -Depth 8
             $unauthorizedStatus = 0
-            try { Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8080/v1/chat/completions' -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 30 -ErrorAction Stop | Out-Null; $unauthorizedStatus = 200 } catch { if ($_.Exception.Response) { $unauthorizedStatus = [int]$_.Exception.Response.StatusCode.value__ } }
+            try { Invoke-WebRequest -UseBasicParsing -Uri ($gatewayBase + '/v1/chat/completions') -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 30 -ErrorAction Stop | Out-Null; $unauthorizedStatus = 200 } catch { if ($_.Exception.Response) { $unauthorizedStatus = [int]$_.Exception.Response.StatusCode.value__ } }
             if ($unauthorizedStatus -in @(401, 403)) { Add-Result 'unauthenticated-inference-rejected' 'passed' 'Inference route rejects missing credentials.' }
             else { Add-Result 'unauthenticated-inference-rejected' 'failed' "Unexpected unauthenticated status: $unauthorizedStatus" }
 
@@ -282,7 +318,7 @@ if (-not $docker) {
                 try {
                     $key = (Get-Content -LiteralPath $secretPath -Raw).Trim()
                     $headers = @{ Authorization = 'Bearer ' + $key }
-                    $response = Invoke-RestMethod -Uri 'http://127.0.0.1:8080/v1/chat/completions' -Method Post -Headers $headers -ContentType 'application/json' -Body $body -TimeoutSec 180 -ErrorAction Stop
+                    $response = Invoke-RestMethod -Uri ($gatewayBase + '/v1/chat/completions') -Method Post -Headers $headers -ContentType 'application/json' -Body $body -TimeoutSec 180 -ErrorAction Stop
                     if ([string]$response.choices[0].message.content -match 'ACCEPTANCE_CORE_OK') { Add-Result 'authenticated-inference' 'passed' 'Authenticated inference returned the expected visible answer.' }
                     else { Add-Result 'authenticated-inference' 'failed' 'Authenticated inference returned an unexpected answer.' }
                 } catch { Add-Result 'authenticated-inference' 'failed' 'Authenticated inference failed.' }
@@ -291,28 +327,28 @@ if (-not $docker) {
             if (Test-Path -LiteralPath $secretPath -PathType Leaf) {
                 try {
                     $agentBody = @{ model = [string]$receipt.model_id; message = 'Reply with exactly ACCEPTANCE_AGENT_OK.'; task_id = ('acceptance-' + [guid]::NewGuid().ToString('N')) } | ConvertTo-Json -Depth 8
-                    $agentResponse = Invoke-RestMethod -Uri 'http://127.0.0.1:8080/v1/task' -Method Post -Headers $headers -ContentType 'application/json' -Body $agentBody -TimeoutSec 180 -ErrorAction Stop
+                    $agentResponse = Invoke-RestMethod -Uri ($gatewayBase + '/v1/task') -Method Post -Headers $headers -ContentType 'application/json' -Body $agentBody -TimeoutSec 180 -ErrorAction Stop
                     if ([string]$agentResponse.choices[0].message.content -match 'ACCEPTANCE_AGENT_OK') { Add-Result 'authenticated-agent-task' 'passed' 'Agent task returned the expected visible answer.' }
                     else { Add-Result 'authenticated-agent-task' 'failed' 'Agent task returned an unexpected answer.' }
                 } catch { Add-Result 'authenticated-agent-task' 'failed' 'Authenticated agent task failed.' }
 
                 try {
                     $identityBody = @{ model = [string]$receipt.model_id; message = 'Tell me exactly what model are you?'; task_id = ('identity-' + [guid]::NewGuid().ToString('N')) } | ConvertTo-Json -Depth 8
-                    $identity = Invoke-RestMethod -Uri 'http://127.0.0.1:8080/v1/task' -Method Post -Headers $headers -ContentType 'application/json' -Body $identityBody -TimeoutSec 180 -ErrorAction Stop
+                    $identity = Invoke-RestMethod -Uri ($gatewayBase + '/v1/task') -Method Post -Headers $headers -ContentType 'application/json' -Body $identityBody -TimeoutSec 180 -ErrorAction Stop
                     if ([string]$identity.choices[0].message.content -match [regex]::Escape([string]$receipt.model_id)) { Add-Result 'model-identity' 'passed' 'Interactive agent reports the verified deployment model.' }
                     else { Add-Result 'model-identity' 'failed' 'Agent model identity did not match the receipt.' }
                 } catch { Add-Result 'model-identity' 'failed' 'Model identity task failed.' }
 
                 try {
                     $filesystemBody = @{ model = [string]$receipt.model_id; message = 'List every folder recursively under F:\study\AI\_ML\LocalAI\LocalAIDocker\config.'; task_id = ('filesystem-' + [guid]::NewGuid().ToString('N')) } | ConvertTo-Json -Depth 8
-                    $filesystem = Invoke-RestMethod -Uri 'http://127.0.0.1:8080/v1/task' -Method Post -Headers $headers -ContentType 'application/json' -Body $filesystemBody -TimeoutSec 180 -ErrorAction Stop
+                    $filesystem = Invoke-RestMethod -Uri ($gatewayBase + '/v1/task') -Method Post -Headers $headers -ContentType 'application/json' -Body $filesystemBody -TimeoutSec 180 -ErrorAction Stop
                     if ([string]$filesystem.choices[0].message.content -match 'WINDOWS_FILESYSTEM_SCAN_OK' -and @($filesystem.tools_used | Where-Object name -eq 'list_windows_directories').Count -gt 0) { Add-Result 'windows-filesystem-agent-tool' 'passed' 'Authenticated agent enumerated the target-local Windows tree through the bridge.' }
                     else { Add-Result 'windows-filesystem-agent-tool' 'failed' 'Agent did not return a verified filesystem scan.' }
                 } catch { Add-Result 'windows-filesystem-agent-tool' 'failed' 'Filesystem agent task failed.' }
 
                 try {
                     $commandBody = @{ model = [string]$receipt.model_id; message = 'run: python --version'; task_id = ('command-' + [guid]::NewGuid().ToString('N')) } | ConvertTo-Json -Depth 8
-                    $command = Invoke-RestMethod -Uri 'http://127.0.0.1:8080/v1/task' -Method Post -Headers $headers -ContentType 'application/json' -Body $commandBody -TimeoutSec 180 -ErrorAction Stop
+                    $command = Invoke-RestMethod -Uri ($gatewayBase + '/v1/task') -Method Post -Headers $headers -ContentType 'application/json' -Body $commandBody -TimeoutSec 180 -ErrorAction Stop
                     if ([string]$command.choices[0].message.content -match 'COMMAND_EXECUTION_RESULT' -and @($command.tools_used | Where-Object name -eq 'run_command').Count -gt 0) { Add-Result 'structured-command-agent-tool' 'passed' 'Explicit command request used the bounded argv path.' }
                     else { Add-Result 'structured-command-agent-tool' 'failed' 'Agent did not return a verified structured command result.' }
                 } catch { Add-Result 'structured-command-agent-tool' 'failed' 'Structured command agent task failed.' }
@@ -345,7 +381,7 @@ if (-not $docker) {
                     }
                     try {
                         $probeBody = @{ model = [string]$receipt.model_id; message = [string]$packProbes[$optionalPack].message; task_id = ('acceptance-pack-' + $optionalPack + '-' + [guid]::NewGuid().ToString('N')) } | ConvertTo-Json -Depth 8
-                        $probe = Invoke-RestMethod -Uri 'http://127.0.0.1:8080/v1/task' -Method Post -Headers $headers -ContentType 'application/json' -Body $probeBody -TimeoutSec 180 -ErrorAction Stop
+                        $probe = Invoke-RestMethod -Uri ($gatewayBase + '/v1/task') -Method Post -Headers $headers -ContentType 'application/json' -Body $probeBody -TimeoutSec 180 -ErrorAction Stop
                         $markerFound = [string]$probe.choices[0].message.content -match [regex]::Escape([string]$packProbes[$optionalPack].marker)
                         $toolFound = @($probe.tools_used | Where-Object name -eq ([string]$packProbes[$optionalPack].tool)).Count -gt 0
                         if ($markerFound -and $toolFound) { Add-Result ("pack-$optionalPack") 'passed' 'Optional pack behavior and tool receipt were verified.' }

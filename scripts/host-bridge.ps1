@@ -16,9 +16,17 @@ $BridgeKey = (Get-Content -LiteralPath $KeyPath -Raw -Encoding UTF8).Trim()
 if ([string]::IsNullOrWhiteSpace($BridgeKey)) { throw 'Host bridge key is empty.' }
 
 $ResolvedProjectRoot = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $ProjectRoot).Path).TrimEnd('\')
-$ReadRoot = [IO.Path]::GetPathRoot($ResolvedProjectRoot)
+$ReadRoot = $ResolvedProjectRoot
 $WriteRoot = $ResolvedProjectRoot
-$ScriptSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$hashAlgorithm = [Security.Cryptography.SHA256]::Create()
+$hashStream = [IO.File]::OpenRead($PSCommandPath)
+try {
+    [void]$hashAlgorithm.ComputeHash($hashStream)
+    $ScriptSha256 = ([BitConverter]::ToString($hashAlgorithm.Hash) -replace '-', '').ToLowerInvariant()
+} finally {
+    $hashStream.Dispose()
+    $hashAlgorithm.Dispose()
+}
 $MaxHeaderBytes = 64KB
 $MaxBodyBytes = 20MB
 $Listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Parse('127.0.0.1'), $Port)
@@ -36,8 +44,11 @@ function New-ConfirmationRecord {
     param(
         [Parameter(Mandatory = $true)][string]$Operation,
         [Parameter(Mandatory = $true)][string]$Risk,
-        [Parameter(Mandatory = $true)]$Details
+        [Parameter(Mandatory = $true)]$Details,
+        [Parameter(Mandatory = $true)][bool]$UserConfirmed,
+        [Parameter(Mandatory = $true)][string]$Source
     )
+    if (-not $UserConfirmed) { throw 'An explicit user confirmation is required for this operation.' }
     $confirmationId = 'confirmation-' + [guid]::NewGuid().ToString('N')
     $confirmationPath = Join-Path $ResolvedProjectRoot ('state\confirmations\' + $confirmationId + '.json')
     $record = [ordered]@{
@@ -46,11 +57,20 @@ function New-ConfirmationRecord {
         risk = $Risk
         operation = $Operation
         details = $Details
-        user_confirmed = $true
+        user_confirmed = $UserConfirmed
+        confirmation_source = $Source
         created_at = (Get-Date).ToUniversalTime().ToString('o')
     }
     Write-JsonAtomic $confirmationPath $record
     return [ordered]@{ confirmation_id = $confirmationId; path = $confirmationPath }
+}
+
+function Assert-ExplicitUserIntent {
+    param([Parameter(Mandatory = $true)]$Request)
+    $value = if ($Request.Headers.ContainsKey('x-localaidocker-user-intent')) { [string]$Request.Headers['x-localaidocker-user-intent'] } else { '' }
+    if (-not $value.Equals('explicit', [StringComparison]::Ordinal)) {
+        throw [UnauthorizedAccessException]::new('an explicit user-intent marker is required')
+    }
 }
 
 function Test-ContainedPath {
@@ -86,7 +106,7 @@ function Resolve-ReadPath {
     if ([string]::IsNullOrWhiteSpace($Path) -or $Path.IndexOf([char]0) -ge 0) { throw 'A non-empty path is required.' }
     $candidate = if ([IO.Path]::IsPathRooted($Path)) { $Path } else { Join-Path $ResolvedProjectRoot $Path }
     $full = [IO.Path]::GetFullPath($candidate)
-    if (-not (Test-ContainedPath $full $ReadRoot)) { throw 'The requested path is outside the configured read-only drive.' }
+    if (-not (Test-ContainedPath $full $ReadRoot)) { throw 'The requested path is outside the LocalAIDocker project.' }
     if (-not (Test-Path -LiteralPath $full)) { throw "Path does not exist: $full" }
     $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
     Assert-NoReparseAncestors -Path $full -Root $ReadRoot
@@ -283,7 +303,7 @@ function Set-ProjectFile {
     New-Item -ItemType Directory -Path $parent -Force | Out-Null
     $temporary = Join-Path $parent ('.' + [IO.Path]::GetFileName($target) + '.' + [guid]::NewGuid().ToString('N') + '.tmp')
     $backup = $null
-    $confirmation = New-ConfirmationRecord -Operation 'write_file' -Risk 'high' -Details ([ordered]@{ path = $target; bytes = ([Text.Encoding]::UTF8.GetBytes([string]$Payload.content)).Length })
+    $confirmation = New-ConfirmationRecord -Operation 'write_file' -Risk 'high' -Details ([ordered]@{ path = $target; bytes = ([Text.Encoding]::UTF8.GetBytes([string]$Payload.content)).Length }) -UserConfirmed $true -Source 'explicit-user-request'
     try {
         if (Test-Path -LiteralPath $target -PathType Leaf) {
             $backup = $target + '.bak.' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
@@ -348,7 +368,7 @@ function Open-DefaultChrome {
     if ($Payload.PSObject.Properties.Name -contains 'new_tab' -and $null -ne $Payload.new_tab) { $newTab = [bool]$Payload.new_tab }
     $arguments = if ($newTab) { @('--new-tab', $uri.AbsoluteUri) } else { @($uri.AbsoluteUri) }
     $process = Start-Process -FilePath $chrome -ArgumentList $arguments -WorkingDirectory (Split-Path -Parent $chrome) -PassThru -ErrorAction Stop
-    $confirmation = New-ConfirmationRecord -Operation 'open_default_chrome' -Risk 'external-effect' -Details ([ordered]@{ url = $uri.AbsoluteUri; browser = 'chrome'; new_tab = $newTab; process_id = $process.Id })
+    $confirmation = New-ConfirmationRecord -Operation 'open_default_chrome' -Risk 'external-effect' -Details ([ordered]@{ url = $uri.AbsoluteUri; browser = 'chrome'; new_tab = $newTab; process_id = $process.Id }) -UserConfirmed $true -Source 'explicit-user-request'
     [ordered]@{
         status = 'opened-requested'
         operation = 'open_default_chrome'
@@ -373,8 +393,8 @@ function Invoke-Request {
     switch ($Request.Path) {
         '/v1/files/list' { if ($Request.Method -ne 'POST') { throw 'POST required.' }; return Get-FolderListing -Payload $payload }
         '/v1/files/read' { if ($Request.Method -ne 'POST') { throw 'POST required.' }; return Get-FileText -Payload $payload }
-        '/v1/files/write' { if ($Request.Method -ne 'POST') { throw 'POST required.' }; return Set-ProjectFile -Payload $payload }
-        '/v1/browser/open' { if ($Request.Method -ne 'POST') { throw 'POST required.' }; return Open-DefaultChrome -Payload $payload }
+        '/v1/files/write' { if ($Request.Method -ne 'POST') { throw 'POST required.' }; Assert-ExplicitUserIntent $Request; return Set-ProjectFile -Payload $payload }
+        '/v1/browser/open' { if ($Request.Method -ne 'POST') { throw 'POST required.' }; Assert-ExplicitUserIntent $Request; return Open-DefaultChrome -Payload $payload }
         '/v1/process/list' {
             if ($Request.Method -ne 'POST') { throw 'POST required.' }
             # Name and Id are available for protected processes where CPU/path
